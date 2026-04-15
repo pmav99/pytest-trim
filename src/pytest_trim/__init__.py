@@ -1,0 +1,2 @@
+"""pytest-trim package."""
+
