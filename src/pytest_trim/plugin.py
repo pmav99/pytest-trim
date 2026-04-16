@@ -1,19 +1,36 @@
-"""Minimal, agent-friendly pytest output."""
+"""Minimal, machine-friendly pytest output."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import re
 import sys
 
 import pytest
 
-PASS_MESSAGE = "PASS"
-FAIL_MESSAGE = "FAIL"
-REPEAT_MESSAGE = "REPEAT"
-RERUN_MESSAGE = "RERUN"
-NO_TESTS_MESSAGE = "NO_TESTS"
-ERROR_MESSAGE = "ERROR"
+RUN_COMPLETE = "COMPLETE"
+RUN_BROKEN = "BROKEN"
+RUN_NO_TESTS = "NO_TESTS"
+RUN_ERROR = "ERROR"
+RUN_INTERRUPTED = "INTERRUPTED"
+
+VERDICT_PASS = "PASS"
+VERDICT_FAIL = "FAIL"
+VERDICT_NONE = "NONE"
+VERDICT_UNKNOWN = "UNKNOWN"
+
+ACTION_DONE = "DONE"
+ACTION_RUN_FULL = "RUN_FULL"
+ACTION_FIX = "FIX"
+ACTION_REPAIR_RUN = "REPAIR_RUN"
+ACTION_ADJUST = "ADJUST"
+ACTION_STOP = "STOP"
+
+SCOPE_FULL = "FULL"
+SCOPE_PARTIAL = "PARTIAL"
+SCOPE_NONE = "NONE"
+
 _DETAIL_LIMIT = 2
 _NOISE_PATTERNS = (
     re.compile(r"^Use -v to get more diff$"),
@@ -23,18 +40,33 @@ _NOISE_PATTERNS = (
 )
 
 
+@dataclass(frozen=True)
+class FinalOutcome:
+    run: str
+    verdict: str
+    scope: str
+    action: str
+
+    def render(self) -> str:
+        return render_final_line(self.run, self.verdict, self.scope, self.action)
+
+
+def render_final_line(run: str, verdict: str, scope: str, action: str) -> str:
+    return f"RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
-        "--agent",
+        "--trim",
         action="store_true",
         default=False,
-        help="Enable minimal agent-friendly output format",
+        help="Enable compact machine-friendly output format",
     )
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_configure(config: pytest.Config) -> None:
-    if not config.getoption("--agent", default=False):
+    if not config.getoption("--trim", default=False):
         return
 
     terminal_reporter = config.pluginmanager.getplugin("terminalreporter")
@@ -44,7 +76,7 @@ def pytest_configure(config: pytest.Config) -> None:
     if terminal_reporter is not None:
         terminal_reporter._tw = QuietTerminalWriter(terminal_reporter._tw)
 
-    config.pluginmanager.register(AgentReporter(config), "agentreporter")
+    config.pluginmanager.register(TrimReporter(config), "trimreporter")
 
 
 class QuietTerminalWriter:
@@ -81,27 +113,31 @@ class QuietTerminalWriter:
         del lines, indents
 
 
-class AgentTerminalWriter:
-    """Tiny stdout-backed writer for compact agent output."""
+class TrimTerminalWriter:
+    """Tiny stdout-backed writer for compact pytest output."""
 
     def line(self, text: str = "") -> None:
         sys.stdout.write(f"{text}\n")
         sys.stdout.flush()
 
 
-class AgentReporter:
-    """Replacement terminal reporter with compact failure blocks and a final status token."""
+class TrimReporter:
+    """Replacement terminal reporter with compact failure blocks and a final protocol line."""
 
     def __init__(self, config: pytest.Config) -> None:
         self.config = config
         self.stats: dict[str, list[object]] = {}
         self._issues: list[object] = []
-        self._tw = AgentTerminalWriter()
+        self._diagnostics: list[str] = []
+        self._tw = TrimTerminalWriter()
         self._session: pytest.Session | None = None
         self._stepwise_plugin = config.pluginmanager.getplugin("stepwiseplugin")
+        self._last_failed_plugin = config.pluginmanager.getplugin("lfplugin")
         self._stepwise_active = bool(config.getoption("stepwise"))
+        self._keyboard_interrupt = False
+        self._internal_error = False
         self._issues_emitted = False
-        self._status_emitted = False
+        self._final_line_emitted = False
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.failed:
@@ -266,9 +302,23 @@ class AgentReporter:
     def pytest_deselected(self, items: list[pytest.Item]) -> None:
         self.stats.setdefault("deselected", []).extend(items)
 
-    def pytest_internalerror(self, excrepr: object) -> None:
-        self._tw.line(f"INTERNAL ERROR: {excrepr}")
-        self._emit_status(ERROR_MESSAGE)
+    def pytest_internalerror(self, excrepr: object, excinfo: object) -> bool:
+        del excinfo
+
+        self._internal_error = True
+        self._diagnostics.append(f"INTERNAL ERROR: {self._internal_error_message(excrepr)}")
+        return True
+
+    def pytest_keyboard_interrupt(self, excinfo: object) -> None:
+        value = getattr(excinfo, "value", None)
+        if value is None:
+            self._keyboard_interrupt = True
+            return
+
+        if type(value).__name__ == "Interrupted":
+            return
+
+        self._keyboard_interrupt = True
 
     def pytest_warning_recorded(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -281,11 +331,11 @@ class AgentReporter:
     def pytest_unconfigure(self, config: pytest.Config) -> None:
         del config
 
-        if self._status_emitted:
+        if self._final_line_emitted:
             return
 
         self._emit_issues()
-        self._emit_status(self._status_message(self._final_exitstatus()))
+        self._emit_final_line(self._final_outcome().render())
 
     def pytest_terminal_summary(
         self,
@@ -295,34 +345,50 @@ class AgentReporter:
     ) -> None:
         del terminalreporter, exitstatus, config
 
-    def _status_message(self, exitstatus: int) -> str:
-        if self._stepwise_continue_required():
-            return REPEAT_MESSAGE
+    def _final_outcome(self) -> FinalOutcome:
+        exitstatus = self._final_exitstatus()
+        scope = self._resolved_scope(exitstatus)
 
-        if self._stepwise_completed_after_resume():
-            return RERUN_MESSAGE
+        if self._internal_error or exitstatus == pytest.ExitCode.INTERNAL_ERROR:
+            return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_STOP)
 
-        if self._issues or exitstatus == pytest.ExitCode.TESTS_FAILED:
-            return FAIL_MESSAGE
+        if self._keyboard_interrupt:
+            return FinalOutcome(RUN_INTERRUPTED, VERDICT_UNKNOWN, scope, ACTION_STOP)
+
+        if self._no_tests_collected(exitstatus):
+            return FinalOutcome(RUN_NO_TESTS, VERDICT_NONE, SCOPE_NONE, ACTION_ADJUST)
+
+        if self._ordinary_failure(exitstatus):
+            if self._behavior_failure_detected() or not self._issues:
+                return FinalOutcome(RUN_COMPLETE, VERDICT_FAIL, scope, ACTION_FIX)
+
+            return FinalOutcome(RUN_BROKEN, VERDICT_FAIL, scope, ACTION_REPAIR_RUN)
 
         if exitstatus == pytest.ExitCode.OK:
-            return PASS_MESSAGE
+            action = ACTION_RUN_FULL if self._successful_run_requires_full_followup() else ACTION_DONE
+            return FinalOutcome(RUN_COMPLETE, VERDICT_PASS, scope, action)
 
-        if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED:
-            return NO_TESTS_MESSAGE
+        if exitstatus == pytest.ExitCode.INTERRUPTED:
+            return FinalOutcome(RUN_INTERRUPTED, VERDICT_UNKNOWN, scope, ACTION_STOP)
 
-        return ERROR_MESSAGE
+        if exitstatus == pytest.ExitCode.USAGE_ERROR:
+            return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_STOP)
 
-    def _emit_status(self, status: str) -> None:
-        if self._status_emitted:
+        return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_STOP)
+
+    def _emit_final_line(self, line: str) -> None:
+        if self._final_line_emitted:
             return
 
-        self._tw.line(status)
-        self._status_emitted = True
+        self._tw.line(line)
+        self._final_line_emitted = True
 
     def _emit_issues(self) -> None:
         if self._issues_emitted:
             return
+
+        for line in self._diagnostics:
+            self._tw.line(line)
 
         for report in self._issues:
             for line in self._format_issue_lines(report):
@@ -354,3 +420,75 @@ class AgentReporter:
             status.startswith("skipping ")
             for status in getattr(self._stepwise_plugin, "report_status", [])
         )
+
+    def _reran_previous_failures(self) -> bool:
+        if not self.config.getoption("lf", default=False) or self._last_failed_plugin is None:
+            return False
+
+        count = getattr(self._last_failed_plugin, "_previously_failed_count", None)
+        report_status = getattr(self._last_failed_plugin, "_report_status", "")
+        return bool(count) and isinstance(report_status, str) and report_status.startswith(
+            "rerun previous "
+        )
+
+    def _successful_run_requires_full_followup(self) -> bool:
+        return self._stepwise_completed_after_resume() or self._reran_previous_failures()
+
+    def _ordinary_failure(self, exitstatus: int) -> bool:
+        return bool(self._issues) or exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def _behavior_failure_detected(self) -> bool:
+        return any(
+            isinstance(report, pytest.TestReport) and report.when == "call"
+            for report in self._issues
+        )
+
+    def _resolved_scope(self, exitstatus: int) -> str:
+        if self._no_tests_collected(exitstatus):
+            return SCOPE_NONE
+
+        if self._partial_scope_requested():
+            return SCOPE_PARTIAL
+
+        return SCOPE_FULL
+
+    def _partial_scope_requested(self) -> bool:
+        return any(
+            (
+                self._explicit_selection_requested(),
+                self._selection_deselected_items(),
+                self._reran_previous_failures(),
+                self._stepwise_partial_scope(),
+            )
+        )
+
+    def _explicit_selection_requested(self) -> bool:
+        option = self.config.option
+        return any(
+            (
+                bool(getattr(option, "file_or_dir", [])),
+                bool(getattr(option, "keyword", "")),
+                bool(getattr(option, "markexpr", "")),
+                bool(getattr(option, "deselect", [])),
+            )
+        )
+
+    def _selection_deselected_items(self) -> bool:
+        return bool(self.stats.get("deselected"))
+
+    def _stepwise_partial_scope(self) -> bool:
+        return self._stepwise_continue_required() or self._stepwise_completed_after_resume()
+
+    def _no_tests_collected(self, exitstatus: int) -> bool:
+        return exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and not self._issues
+
+    def _internal_error_message(self, excrepr: object) -> str:
+        reprcrash = getattr(excrepr, "reprcrash", None)
+        if reprcrash is not None and getattr(reprcrash, "message", ""):
+            return str(reprcrash.message)
+
+        fallback = str(excrepr).strip()
+        if not fallback:
+            return "unknown internal error"
+
+        return fallback.splitlines()[-1]

@@ -280,4 +280,4 @@ testing = ["filelock"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13"
-content-hash = "0aa2525eaa377235afd058d6f204acd232dc53fd8a414c085fa9620f95ef45bd"
+content-hash = "05096311e15b053d5ea14420b1920b5eaf00e53dd16108424096e72215e6adc7"

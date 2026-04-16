@@ -1,7 +1,7 @@
 [project]
 name = "pytest-trim"
 version = "0.1.0"
-description = "A pytest plugin that emits minimal, agent-friendly failure output."
+description = "A pytest plugin that emits compact, machine-friendly failure output."
 readme = "README.md"
 authors = [
     {name = "Panos Mavrogiorgos",email = "pmav99@gmail.com"}

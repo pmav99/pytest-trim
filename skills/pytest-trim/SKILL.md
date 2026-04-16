@@ -1,29 +1,35 @@
 ---
 name: pytest-trim
-description: Use when running pytest in a Python project and the user wants compact, agent-friendly test output for debugging failures or iterating on fixes. Prefer pytest-trim over default pytest terminal output. Try `pytest --agent` first when the plugin may already be installed; if needed, retry with `pytest -p pytest_trim.plugin --agent`.
+description: Use when working in a Python project where `pytest-trim` may be available and you need to run pytest with compact, machine-friendly output instead of normal terminal noise. Trigger when running tests, inspecting failures, or iterating on fixes would benefit from one issue block per failure plus a final `RUN=... VERDICT=... SCOPE=... ACTION=...` line. First try `pytest --trim`; if needed, retry with `pytest -p pytest_trim.plugin --trim`.
 ---
 
 # Pytest Trim
 
-Use this skill when you need concise pytest output that is easy for an agent to parse.
+Use this skill when you need concise pytest output that is easy for an agent to
+parse.
+
+If your tooling supports repo-local skills, this file describes how to invoke
+`pytest-trim` and interpret its final protocol line.
 
 ## When To Use It
 
 - The user asks to run pytest with minimal or machine-friendly output.
-- You are debugging test failures and want one line per issue plus a final status token.
+- The user asks to run or rerun pytest, and compact output would make the
+  failures easier to act on.
+- You are debugging test failures and want one line per issue plus a final protocol line.
 - You are iterating with `pytest --sw` and need a compact loop signal.
 
 ## Command Selection
 
-1. Prefer `pytest --agent ...` when the plugin may already be installed through pytest's plugin discovery.
-2. If that does not activate the compact output, retry with `pytest -p pytest_trim.plugin --agent ...`.
-3. If `pytest` rejects `--agent`, assume the plugin is not available in the current environment and fall back to normal pytest usage.
+1. Prefer `pytest --trim ...` when the plugin may already be installed through pytest's plugin discovery.
+2. If that does not activate the compact output, retry with `pytest -p pytest_trim.plugin --trim ...`.
+3. If `pytest` rejects `--trim`, assume the plugin is not available in the current environment and fall back to normal pytest usage.
 
-The plugin only changes output when `--agent` is present.
+The plugin only changes output when `--trim` is present.
 
 ## Output Contract
 
-Treat the final non-empty line as the status token. Any earlier non-empty lines are issue reports.
+Treat the final non-empty line as the protocol line. Any earlier non-empty lines are issue reports.
 
 Issue lines are emitted in one of these forms:
 
@@ -32,31 +38,73 @@ Issue lines are emitted in one of these forms:
 
 This includes normal test failures and collection/setup/teardown failures.
 
-Current status tokens:
+The final line always has this shape:
 
-- `PASS`: the run completed successfully with no reported issues.
-- `FAIL`: one or more issues were emitted above.
-- `REPEAT`: a `--sw` run stopped at a remembered failure. After fixing the problem, rerun the same stepwise command to continue.
-- `RERUN`: a resumed `--sw` run reached the end after continuing from an earlier stepwise stop. This is distinct from a fresh full-run `PASS`.
-- `NO_TESTS`: pytest collected no tests.
-- `ERROR`: pytest hit an internal error.
+`RUN=... VERDICT=... SCOPE=... ACTION=...`
+
+Fields:
+
+- `RUN` is the coarse outcome category.
+- `VERDICT` is the behavior verdict when one was produced.
+- `SCOPE` is the intended or resolved run scope after selection resolution.
+- `ACTION` is the agent-facing next-step signal.
+
+Current `RUN` values:
+
+- `COMPLETE`: ordinary completed runs that produced a usable behavior verdict,
+  including normal test failures.
+- `BROKEN`: recognized run-viability failures such as collection, import,
+  setup, or teardown problems where the run needs repair first.
+- `NO_TESTS`: pytest collected or selected no tests.
+- `ERROR`: pytest or a plugin crashed abnormally.
+- `INTERRUPTED`: the run was explicitly interrupted, such as `Ctrl-C` or `pytest.exit(...)`.
+
+Current `VERDICT` values:
+
+- `PASS`
+- `FAIL`
+- `NONE`
+- `UNKNOWN`
+
+Current `SCOPE` values:
+
+- `FULL`: full-suite target after selection resolution.
+- `PARTIAL`: intentionally narrowed or mode-limited subset, such as explicit
+  paths, `-k`, `-m`, `--lf` reruns, resumed or currently-stopped `--sw`, and
+  similar subset-selection plugins.
+- `NONE`: zero tests were selected to run.
+
+Current `ACTION` values:
+
+- `DONE`: no mode-implied follow-up pytest command.
+- `RUN_FULL`: one final full verification pass should happen next.
+- `FIX`: tests ran meaningfully and found product or test-behavior failures.
+- `REPAIR_RUN`: the run is broken and needs to be made runnable first.
+- `ADJUST`: the invocation or selection is wrong or too narrow.
+- `STOP`: automatic continuation is unsafe or not useful.
 
 ## Operating Guidance
 
 - Parse the last non-empty line first.
-- If the status is `FAIL`, use the preceding issue lines as the actionable failures.
-- If the status is `REPEAT`, keep the `--sw` loop and rerun after making a fix.
-- If the status is `RERUN`, understand that the successful result came from a resumed stepwise run rather than a fresh run from the start.
-- Do not expect default pytest progress output, summaries, warning sections, or verbose formatting while `--agent` is active.
+- If `ACTION=FIX`, use the preceding issue lines as the actionable failures.
+- If `ACTION=REPAIR_RUN`, repair the run first, then rerun the same pytest command.
+- If `ACTION=RUN_FULL`, run one final full verification pass next.
+- If `RUN=NO_TESTS`, adjust the selection before rerunning.
+- If `RUN=ERROR` or `RUN=INTERRUPTED`, stop and surface the abnormal condition.
+- Treat `SCOPE` as target scope, not achieved verification completeness. Full-run
+  `-x` and `--maxfail` still report `SCOPE=FULL`.
+- If any call-phase behavior failure is present, prefer the `RUN=COMPLETE
+  VERDICT=FAIL ACTION=FIX` interpretation even if teardown also failed.
+- Do not expect default pytest progress output, summaries, warning sections, or verbose formatting while `--trim` is active.
 
 ## Examples
 
 ```bash
-pytest --agent
-pytest --agent -k failing_test
-pytest --agent --maxfail=1
-pytest --agent --sw
-pytest -p pytest_trim.plugin --agent
+pytest --trim
+pytest --trim -k failing_test
+pytest --trim --maxfail=1
+pytest --trim --sw
+pytest -p pytest_trim.plugin --trim
 ```
 
 ## Source Of Truth

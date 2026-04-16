@@ -9,14 +9,26 @@ from pathlib import Path
 
 import pytest
 
-from pytest_trim.plugin import AgentReporter
-from pytest_trim.plugin import ERROR_MESSAGE
-from pytest_trim.plugin import FAIL_MESSAGE
-from pytest_trim.plugin import NO_TESTS_MESSAGE
-from pytest_trim.plugin import PASS_MESSAGE
-from pytest_trim.plugin import RERUN_MESSAGE
-from pytest_trim.plugin import REPEAT_MESSAGE
+from pytest_trim.plugin import ACTION_ADJUST
+from pytest_trim.plugin import ACTION_DONE
+from pytest_trim.plugin import ACTION_FIX
+from pytest_trim.plugin import ACTION_REPAIR_RUN
+from pytest_trim.plugin import ACTION_RUN_FULL
+from pytest_trim.plugin import ACTION_STOP
+from pytest_trim.plugin import RUN_BROKEN
+from pytest_trim.plugin import RUN_COMPLETE
+from pytest_trim.plugin import RUN_ERROR
+from pytest_trim.plugin import RUN_INTERRUPTED
+from pytest_trim.plugin import RUN_NO_TESTS
+from pytest_trim.plugin import SCOPE_FULL
+from pytest_trim.plugin import SCOPE_NONE
+from pytest_trim.plugin import SCOPE_PARTIAL
+from pytest_trim.plugin import VERDICT_FAIL
+from pytest_trim.plugin import VERDICT_NONE
+from pytest_trim.plugin import VERDICT_PASS
+from pytest_trim.plugin import VERDICT_UNKNOWN
 from pytest_trim.plugin import pytest_configure
+from pytest_trim.plugin import render_final_line
 
 
 PLUGIN_NAME = "pytest_trim.plugin"
@@ -30,18 +42,65 @@ def local_plugin_importable(monkeypatch: pytest.MonkeyPatch) -> Path:
     existing = os.environ.get("PYTHONPATH")
     pythonpath = str(src_dir) if not existing else f"{src_dir}{os.pathsep}{existing}"
     monkeypatch.setenv("PYTHONPATH", pythonpath)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     return src_dir
 
 
-def run_agent_pytest(
+def run_trim_pytest(
     pytester: pytest.Pytester,
     *args: str,
+    plugins: tuple[str, ...] = (),
 ) -> pytest.RunResult:
-    return pytester.runpytest("-p", PLUGIN_NAME, "--agent", *args)
+    plugin_args: list[str] = []
+    for plugin in plugins:
+        plugin_args.extend(["-p", plugin])
+
+    return pytester.runpytest("-p", PLUGIN_NAME, *plugin_args, "--trim", *args)
+
+
+def non_empty_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.strip()]
 
 
 def output_lines(result: pytest.RunResult) -> list[str]:
-    return [line for line in result.stdout.str().splitlines() if line.strip()]
+    return non_empty_lines(result.stdout.str())
+
+
+def final_line(run: str, verdict: str, scope: str, action: str) -> str:
+    return f"RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+
+
+DONE_FULL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_FULL, ACTION_DONE)
+DONE_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_PARTIAL, ACTION_DONE)
+RUN_FULL_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_PARTIAL, ACTION_RUN_FULL)
+FIX_FULL_LINE = final_line(RUN_COMPLETE, VERDICT_FAIL, SCOPE_FULL, ACTION_FIX)
+FIX_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_FAIL, SCOPE_PARTIAL, ACTION_FIX)
+REPAIR_FULL_LINE = final_line(RUN_BROKEN, VERDICT_FAIL, SCOPE_FULL, ACTION_REPAIR_RUN)
+REPAIR_PARTIAL_LINE = final_line(RUN_BROKEN, VERDICT_FAIL, SCOPE_PARTIAL, ACTION_REPAIR_RUN)
+NO_TESTS_LINE = final_line(RUN_NO_TESTS, VERDICT_NONE, SCOPE_NONE, ACTION_ADJUST)
+ERROR_FULL_LINE = final_line(RUN_ERROR, VERDICT_UNKNOWN, SCOPE_FULL, ACTION_STOP)
+INTERRUPTED_FULL_LINE = final_line(RUN_INTERRUPTED, VERDICT_UNKNOWN, SCOPE_FULL, ACTION_STOP)
+
+
+def subprocess_env(*pythonpaths: Path, autoload_plugins: bool = False) -> dict[str, str]:
+    env = os.environ.copy()
+
+    path_entries = [str(path) for path in pythonpaths]
+    existing = env.get("PYTHONPATH")
+    if existing:
+        path_entries.append(existing)
+    env["PYTHONPATH"] = os.pathsep.join(path_entries)
+
+    if autoload_plugins:
+        env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
+    else:
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+
+    return env
+
+
+def test_render_final_line_uses_new_protocol_order() -> None:
+    assert render_final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_FULL, ACTION_DONE) == DONE_FULL_LINE
 
 
 def test_all_passes_emit_standard_pass_message(
@@ -59,10 +118,10 @@ def test_all_passes_emit_standard_pass_message(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == [PASS_MESSAGE]
+    assert output_lines(result) == [DONE_FULL_LINE]
 
 
 def test_single_test_failure_emits_one_line(
@@ -78,13 +137,13 @@ def test_single_test_failure_emits_one_line(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert len(lines) == 2
     assert re.fullmatch(r"test_fail\.py::test_boom:\d+ - assert 1 == 2", lines[0])
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == FIX_FULL_LINE
 
 
 def test_assertion_explanations_keep_useful_detail_without_pytest_hints(
@@ -100,7 +159,7 @@ def test_assertion_explanations_keep_useful_detail_without_pytest_hints(
         )
     )
 
-    result = run_agent_pytest(pytester, "--ff", "--nf", "--sw")
+    result = run_trim_pytest(pytester, "--ff", "--nf", "--sw")
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.INTERRUPTED
@@ -110,7 +169,7 @@ def test_assertion_explanations_keep_useful_detail_without_pytest_hints(
         lines[0],
     )
     assert lines[1] == "  detail: Right contains one more item: 4"
-    assert lines[2] == REPEAT_MESSAGE
+    assert lines[2] == FIX_PARTIAL_LINE
 
 
 @pytest.mark.parametrize("verbosity", ["-v", "-vv", "-vvv", "--verbose"])
@@ -128,7 +187,7 @@ def test_verbose_assertion_explanations_ignore_full_diff_block(
         )
     )
 
-    result = run_agent_pytest(pytester, verbosity)
+    result = run_trim_pytest(pytester, verbosity)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -138,7 +197,7 @@ def test_verbose_assertion_explanations_ignore_full_diff_block(
         lines[0],
     )
     assert lines[1] == "  detail: Right contains one more item: 4"
-    assert lines[2] == FAIL_MESSAGE
+    assert lines[2] == FIX_FULL_LINE
 
 
 def test_rich_assertion_output_caps_detail_lines(
@@ -154,7 +213,7 @@ def test_rich_assertion_output_caps_detail_lines(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -163,7 +222,30 @@ def test_rich_assertion_output_caps_detail_lines(
     assert lines[1].startswith("  detail: Differing items:")
     assert lines[2].startswith("  detail: Differing items:")
     assert lines[3] == "  detail: (+1 more details omitted)"
-    assert lines[4] == FAIL_MESSAGE
+    assert lines[4] == FIX_FULL_LINE
+
+
+def test_string_diffs_are_grouped_into_compact_detail_lines(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_diff=(
+            "def test_string_diff():\n"
+            "    assert 'abc' == 'axc'\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = output_lines(result)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert len(lines) == 3
+    assert re.fullmatch(r"test_diff\.py::test_string_diff:\d+ - assert 'abc' == 'axc'", lines[0])
+    assert lines[1] == "  detail: - axc | + abc"
+    assert lines[2] == FIX_FULL_LINE
 
 
 @pytest.mark.parametrize("verbosity", ["-v", "-vv", "-vvv", "--verbose"])
@@ -181,7 +263,7 @@ def test_verbose_rich_assertion_output_still_caps_useful_details(
         )
     )
 
-    result = run_agent_pytest(pytester, verbosity)
+    result = run_trim_pytest(pytester, verbosity)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -190,7 +272,7 @@ def test_verbose_rich_assertion_output_still_caps_useful_details(
     assert lines[1].startswith("  detail: Differing items:")
     assert lines[2].startswith("  detail: Differing items:")
     assert lines[3] == "  detail: (+1 more details omitted)"
-    assert lines[4] == FAIL_MESSAGE
+    assert lines[4] == FIX_FULL_LINE
 
 
 def test_multiple_failures_emit_one_line_each(
@@ -208,7 +290,7 @@ def test_multiple_failures_emit_one_line_each(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -218,7 +300,7 @@ def test_multiple_failures_emit_one_line_each(
         r"test_failures\.py::test_second:\d+ - RuntimeError: boom",
         lines[1],
     )
-    assert lines[2] == FAIL_MESSAGE
+    assert lines[2] == FIX_FULL_LINE
 
 
 def test_setup_failure_is_reported(
@@ -238,7 +320,7 @@ def test_setup_failure_is_reported(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -247,7 +329,7 @@ def test_setup_failure_is_reported(
         r"test_setup\.py::test_uses_fixture:\d+ - RuntimeError: boom in setup",
         lines[0],
     )
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == REPAIR_FULL_LINE
 
 
 def test_teardown_failure_is_reported(
@@ -268,7 +350,7 @@ def test_teardown_failure_is_reported(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -277,7 +359,38 @@ def test_teardown_failure_is_reported(
         r"test_teardown\.py::test_ok:\d+ - RuntimeError: boom in teardown",
         lines[0],
     )
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == REPAIR_FULL_LINE
+
+
+def test_call_and_teardown_failures_emit_one_issue_block_each(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_multi=(
+            "import pytest\n\n"
+            "@pytest.fixture\n"
+            "def broken_teardown():\n"
+            "    yield\n"
+            "    raise RuntimeError('boom in teardown')\n\n"
+            "def test_both_failures(broken_teardown):\n"
+            "    assert 1 == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = output_lines(result)
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert len(lines) == 3
+    assert re.fullmatch(r"test_multi\.py::test_both_failures:\d+ - assert 1 == 2", lines[0])
+    assert re.fullmatch(
+        r"test_multi\.py::test_both_failures:\d+ - RuntimeError: boom in teardown",
+        lines[1],
+    )
+    assert lines[2] == FIX_FULL_LINE
 
 
 def test_collection_syntax_error_is_reported_with_line_number(
@@ -295,13 +408,13 @@ def test_collection_syntax_error_is_reported_with_line_number(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.INTERRUPTED
     assert len(lines) == 2
     assert re.fullmatch(r"test_syntax\.py:\d+ - .*SyntaxError.*", lines[0])
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == REPAIR_FULL_LINE
 
 
 def test_collection_import_error_is_reported(
@@ -318,7 +431,7 @@ def test_collection_import_error_is_reported(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.INTERRUPTED
@@ -327,7 +440,7 @@ def test_collection_import_error_is_reported(
         r"test_import\.py - E\s+ModuleNotFoundError: No module named 'definitely_missing_package'",
         lines[0],
     )
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == REPAIR_FULL_LINE
 
 
 @pytest.mark.parametrize(
@@ -354,13 +467,13 @@ def test_traceback_style_variants_keep_machine_friendly_headline(
         )
     )
 
-    result = run_agent_pytest(pytester, f"--tb={traceback_style}")
+    result = run_trim_pytest(pytester, f"--tb={traceback_style}")
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert len(lines) == 2
     assert re.fullmatch(expected_pattern, lines[0])
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == FIX_FULL_LINE
 
 
 def test_exception_group_is_reported_compactly(
@@ -376,17 +489,17 @@ def test_exception_group_is_reported_compactly(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert lines == [
         "test_group.py::test_group - ExceptionGroup: boom (2 sub-exceptions)",
-        FAIL_MESSAGE,
+        FIX_FULL_LINE,
     ]
 
 
-def test_plugin_is_inactive_without_agent_flag(
+def test_plugin_is_inactive_without_trim_flag(
     pytester: pytest.Pytester,
     local_plugin_importable: Path,
 ) -> None:
@@ -420,10 +533,10 @@ def test_pass_with_stepwise_from_clean_state_uses_plain_pass_message(
         )
     )
 
-    result = run_agent_pytest(pytester, "--sw")
+    result = run_trim_pytest(pytester, "--sw")
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == [PASS_MESSAGE]
+    assert output_lines(result) == [DONE_FULL_LINE]
 
 
 def test_no_tests_collected_emits_no_tests_status(
@@ -439,10 +552,140 @@ def test_no_tests_collected_emits_no_tests_status(
         )
     )
 
-    result = run_agent_pytest(pytester, "-k", "does_not_match_anything")
+    result = run_trim_pytest(pytester, "-k", "does_not_match_anything")
 
     assert result.ret == pytest.ExitCode.NO_TESTS_COLLECTED
-    assert output_lines(result) == [NO_TESTS_MESSAGE]
+    assert output_lines(result) == [NO_TESTS_LINE]
+
+
+def test_no_tests_subprocess_keeps_pytest_exit_code(tmp_path: Path) -> None:
+    package_root = Path(__file__).resolve().parents[1]
+    test_file = tmp_path / "test_ok.py"
+    test_file.write_text(
+        "def test_one():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            PLUGIN_NAME,
+            "--trim",
+            "-k",
+            "does_not_match_anything",
+            str(test_file),
+        ],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(package_root / "src"),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == pytest.ExitCode.NO_TESTS_COLLECTED
+    assert non_empty_lines(result.stdout) == [NO_TESTS_LINE]
+
+
+def test_last_failed_clean_rerun_requests_one_full_follow_up(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    test_file = pytester.path / "test_last_failed.py"
+    test_file.write_text(
+        "def test_first():\n"
+        "    assert False\n\n"
+        "def test_second():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    first_result = run_trim_pytest(pytester)
+    assert first_result.ret == pytest.ExitCode.TESTS_FAILED
+
+    test_file.write_text(
+        "def test_first():\n"
+        "    assert True\n\n"
+        "def test_second():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    second_result = run_trim_pytest(pytester, "--lf")
+
+    assert second_result.ret == pytest.ExitCode.OK
+    assert output_lines(second_result) == [RUN_FULL_PARTIAL_LINE]
+
+
+def test_last_failed_failure_stays_partial_fix_signal(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_last_failed=(
+            "def test_first():\n"
+            "    assert False\n\n"
+            "def test_second():\n"
+            "    assert True\n"
+        )
+    )
+
+    first_result = run_trim_pytest(pytester)
+    assert first_result.ret == pytest.ExitCode.TESTS_FAILED
+
+    second_result = run_trim_pytest(pytester, "--lf")
+
+    lines = output_lines(second_result)
+    assert second_result.ret == pytest.ExitCode.TESTS_FAILED
+    assert len(lines) == 2
+    assert re.fullmatch(r"test_last_failed\.py::test_first:\d+ - assert False", lines[0])
+    assert lines[1] == FIX_PARTIAL_LINE
+
+
+def test_last_failed_without_cached_failures_falls_back_to_full_run(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_ok=(
+            "def test_one():\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "--lf")
+
+    assert result.ret == pytest.ExitCode.OK
+    assert output_lines(result) == [DONE_FULL_LINE]
+
+
+def test_last_failed_without_cached_failures_can_emit_no_tests(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_ok=(
+            "def test_one():\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "--lf", "--lfnf=none")
+
+    assert result.ret == pytest.ExitCode.NO_TESTS_COLLECTED
+    assert output_lines(result) == [NO_TESTS_LINE]
 
 
 def test_maxfail_reports_only_seen_failures(
@@ -460,13 +703,13 @@ def test_maxfail_reports_only_seen_failures(
         )
     )
 
-    result = run_agent_pytest(pytester, "--maxfail=1")
+    result = run_trim_pytest(pytester, "--maxfail=1")
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert len(lines) == 2
     assert re.fullmatch(r"test_maxfail\.py::test_first:\d+ - assert False", lines[0])
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == FIX_FULL_LINE
 
 
 def test_stepwise_failure_emits_repeat_status(
@@ -484,13 +727,13 @@ def test_stepwise_failure_emits_repeat_status(
         )
     )
 
-    result = run_agent_pytest(pytester, "--sw")
+    result = run_trim_pytest(pytester, "--sw")
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.INTERRUPTED
     assert len(lines) == 2
     assert re.fullmatch(r"test_stepwise\.py::test_first:\d+ - assert False", lines[0])
-    assert lines[1] == REPEAT_MESSAGE
+    assert lines[1] == FIX_PARTIAL_LINE
 
 
 def test_stepwise_resume_to_end_emits_rerun_status(
@@ -508,13 +751,13 @@ def test_stepwise_resume_to_end_emits_rerun_status(
         encoding="utf-8",
     )
 
-    first_result = run_agent_pytest(pytester, "--sw")
+    first_result = run_trim_pytest(pytester, "--sw")
 
     first_lines = output_lines(first_result)
     assert first_result.ret == pytest.ExitCode.INTERRUPTED
     assert len(first_lines) == 2
     assert re.fullmatch(r"test_resume\.py::test_first:\d+ - assert False", first_lines[0])
-    assert first_lines[1] == REPEAT_MESSAGE
+    assert first_lines[1] == FIX_PARTIAL_LINE
 
     test_file.write_text(
         "def test_first():\n"
@@ -524,10 +767,10 @@ def test_stepwise_resume_to_end_emits_rerun_status(
         encoding="utf-8",
     )
 
-    second_result = run_agent_pytest(pytester, "--sw")
+    second_result = run_trim_pytest(pytester, "--sw")
 
     assert second_result.ret == pytest.ExitCode.OK
-    assert output_lines(second_result) == [RERUN_MESSAGE]
+    assert output_lines(second_result) == [RUN_FULL_PARTIAL_LINE]
 
 
 def test_failure_reporting_works_with_ff_nf_and_x(
@@ -545,13 +788,13 @@ def test_failure_reporting_works_with_ff_nf_and_x(
         )
     )
 
-    result = run_agent_pytest(pytester, "--ff", "--nf", "-x")
+    result = run_trim_pytest(pytester, "--ff", "--nf", "-x")
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert len(lines) == 2
     assert re.fullmatch(r"test_ordering\.py::test_first:\d+ - assert False", lines[0])
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == FIX_FULL_LINE
 
 
 def test_parametrized_tests_use_full_nodeid(
@@ -569,7 +812,7 @@ def test_parametrized_tests_use_full_nodeid(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
@@ -578,7 +821,7 @@ def test_parametrized_tests_use_full_nodeid(
         r"test_params\.py::test_param\[zero\]:\d+ - assert 0",
         lines[0],
     )
-    assert lines[1] == FAIL_MESSAGE
+    assert lines[1] == FIX_FULL_LINE
 
 
 def test_skip_xfail_xpass_and_deselected_do_not_emit_lines(
@@ -603,10 +846,10 @@ def test_skip_xfail_xpass_and_deselected_do_not_emit_lines(
         )
     )
 
-    result = run_agent_pytest(pytester, "-k", "not deselected")
+    result = run_trim_pytest(pytester, "-k", "not deselected")
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == [PASS_MESSAGE]
+    assert output_lines(result) == [DONE_PARTIAL_LINE]
 
 
 def test_strict_xpass_is_reported_as_failure(
@@ -624,13 +867,13 @@ def test_strict_xpass_is_reported_as_failure(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     lines = output_lines(result)
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert lines == [
         "test_strict_xpass.py::test_xpass - [XPASS(strict)] strict pass",
-        FAIL_MESSAGE,
+        FIX_FULL_LINE,
     ]
 
 
@@ -645,10 +888,30 @@ def test_internal_error_emits_error_status(
         "    raise RuntimeError('boom')\n"
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.INTERNAL_ERROR
-    assert output_lines(result)[-1] == ERROR_MESSAGE
+    assert output_lines(result)[-1] == ERROR_FULL_LINE
+
+
+def test_abnormal_exit_emits_error_status(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_exit=(
+            "import pytest\n\n"
+            "def test_exit():\n"
+            "    pytest.exit('bye')\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert output_lines(result) == [INTERRUPTED_FULL_LINE]
 
 
 def test_usage_error_does_not_claim_final_status_token(
@@ -657,7 +920,7 @@ def test_usage_error_does_not_claim_final_status_token(
 ) -> None:
     del local_plugin_importable
 
-    result = pytester.runpytest("-p", PLUGIN_NAME, "--agent", "--definitely-invalid-option")
+    result = pytester.runpytest("-p", PLUGIN_NAME, "--trim", "--definitely-invalid-option")
 
     stdout = result.stdout.str()
     stderr = result.stderr.str()
@@ -665,12 +928,16 @@ def test_usage_error_does_not_claim_final_status_token(
     assert result.ret == pytest.ExitCode.USAGE_ERROR
     assert "unrecognized arguments: --definitely-invalid-option" in stderr
     for token in (
-        PASS_MESSAGE,
-        FAIL_MESSAGE,
-        REPEAT_MESSAGE,
-        RERUN_MESSAGE,
-        NO_TESTS_MESSAGE,
-        ERROR_MESSAGE,
+        DONE_FULL_LINE,
+        DONE_PARTIAL_LINE,
+        RUN_FULL_PARTIAL_LINE,
+        FIX_FULL_LINE,
+        FIX_PARTIAL_LINE,
+        REPAIR_FULL_LINE,
+        REPAIR_PARTIAL_LINE,
+        NO_TESTS_LINE,
+        ERROR_FULL_LINE,
+        INTERRUPTED_FULL_LINE,
     ):
         assert token not in stdout.splitlines()
         assert token not in stderr.splitlines()
@@ -696,10 +963,10 @@ def test_terminal_summary_hooks_still_run_without_extra_output(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == [PASS_MESSAGE]
+    assert output_lines(result) == [DONE_FULL_LINE]
     assert (pytester.path / "summary-called.txt").read_text(encoding="utf-8") == "yes"
 
 
@@ -721,10 +988,10 @@ def test_terminal_summary_prints_before_final_status_token(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == ["SUMMARY-PRINT", PASS_MESSAGE]
+    assert output_lines(result) == ["SUMMARY-PRINT", DONE_FULL_LINE]
 
 
 def test_terminal_summary_write_raw_stays_hidden(
@@ -745,10 +1012,10 @@ def test_terminal_summary_write_raw_stays_hidden(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == [PASS_MESSAGE]
+    assert output_lines(result) == [DONE_FULL_LINE]
 
 
 def test_capture_disabled_output_still_finishes_with_final_status_token(
@@ -765,10 +1032,47 @@ def test_capture_disabled_output_still_finishes_with_final_status_token(
         )
     )
 
-    result = run_agent_pytest(pytester, "-s")
+    result = run_trim_pytest(pytester, "-s")
 
     assert result.ret == pytest.ExitCode.OK
-    assert output_lines(result) == ["TEST-OUTPUT", PASS_MESSAGE]
+    assert output_lines(result) == ["TEST-OUTPUT", DONE_FULL_LINE]
+
+
+def test_capture_disabled_stderr_output_still_finishes_with_final_status_token(
+    tmp_path: Path,
+) -> None:
+    package_root = Path(__file__).resolve().parents[1]
+    test_file = tmp_path / "test_err.py"
+    test_file.write_text(
+        "import sys\n\n"
+        "def test_one():\n"
+        "    sys.stderr.write('ERR-LINE\\n')\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            PLUGIN_NAME,
+            "--trim",
+            "-s",
+            str(test_file),
+        ],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(package_root / "src"),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert non_empty_lines(result.stdout)[-1] == DONE_PARTIAL_LINE
+    assert result.stderr.splitlines() == ["ERR-LINE"]
 
 
 def test_late_exitstatus_mutation_changes_final_status_token(
@@ -790,13 +1094,13 @@ def test_late_exitstatus_mutation_changes_final_status_token(
         )
     )
 
-    result = run_agent_pytest(pytester)
+    result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.TESTS_FAILED
-    assert output_lines(result) == [FAIL_MESSAGE]
+    assert output_lines(result) == [FIX_FULL_LINE]
 
 
-def test_xdist_run_keeps_compact_final_output(tmp_path: Path) -> None:
+def test_xdist_run_keeps_final_status_token(tmp_path: Path) -> None:
     pytest.importorskip("xdist")
 
     package_root = Path(__file__).resolve().parents[1]
@@ -807,8 +1111,42 @@ def test_xdist_run_keeps_compact_final_output(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(package_root / "src")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            PLUGIN_NAME,
+            "--trim",
+            "-n",
+            "2",
+            str(test_file),
+        ],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(package_root / "src"),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert non_empty_lines(result.stdout)[-1] == DONE_PARTIAL_LINE
+
+
+def test_xdist_failure_keeps_trimmed_headline_before_final_status_token(tmp_path: Path) -> None:
+    pytest.importorskip("xdist")
+
+    package_root = Path(__file__).resolve().parents[1]
+    test_file = tmp_path / "test_fail.py"
+    test_file.write_text(
+        "def test_one():\n"
+        "    assert 1 == 2\n",
+        encoding="utf-8",
+    )
 
     result = subprocess.run(
         [
@@ -817,22 +1155,25 @@ def test_xdist_run_keeps_compact_final_output(tmp_path: Path) -> None:
             "pytest",
             "-q",
             "-p",
+            "xdist.plugin",
+            "-p",
             PLUGIN_NAME,
-            "--agent",
+            "--trim",
             "-n",
             "2",
             str(test_file),
         ],
         capture_output=True,
         text=True,
-        env=env,
+        env=subprocess_env(package_root / "src"),
         cwd=tmp_path,
         check=False,
     )
 
-    assert result.returncode == 0
-    assert result.stdout.splitlines() == [PASS_MESSAGE]
-    assert result.stderr == ""
+    lines = non_empty_lines(result.stdout)
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED
+    assert re.fullmatch(r"test_fail\.py::test_one:\d+ - assert 1 == 2", lines[-2])
+    assert lines[-1] == FIX_PARTIAL_LINE
 
 
 def test_pytest_cov_fail_under_changes_final_status_token(
@@ -856,10 +1197,15 @@ def test_pytest_cov_fail_under_changes_final_status_token(
         ),
     )
 
-    result = run_agent_pytest(pytester, "--cov=thing", "--cov-fail-under=100")
+    result = run_trim_pytest(
+        pytester,
+        "--cov=thing",
+        "--cov-fail-under=100",
+        plugins=("pytest_cov",),
+    )
 
     assert result.ret == pytest.ExitCode.TESTS_FAILED
-    assert output_lines(result) == [FAIL_MESSAGE]
+    assert output_lines(result) == [FIX_FULL_LINE]
 
 
 def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
@@ -879,7 +1225,7 @@ def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
         pluginmanager = DummyPluginManager()
 
         def getoption(self, name: str, default: bool = False) -> bool:
-            assert name == "--agent"
+            assert name == "--trim"
             return True
 
     monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
@@ -889,41 +1235,26 @@ def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
     assert registered == []
 
 
-def test_line_number_absent_falls_back_cleanly(pytester: pytest.Pytester) -> None:
-    class DummyLongrepr:
-        def __str__(self) -> str:
-            return "custom problem"
+def test_pytrace_false_failure_omits_line_number_cleanly(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
 
-    class DummyReport:
-        nodeid = "test_file.py::test_problem"
-        longrepr = DummyLongrepr()
+    pytester.makepyfile(
+        test_plain=(
+            "import pytest\n\n"
+            "def test_fail_no_trace():\n"
+            "    pytest.fail('plain boom', pytrace=False)\n"
+        )
+    )
 
-    reporter = AgentReporter(pytester.parseconfig())
-    emitted_lines: list[str] = []
-    reporter._tw.line = emitted_lines.append
-    reporter._issues = [DummyReport()]
-    reporter._emit_issues()
-    reporter._emit_status(FAIL_MESSAGE)
+    result = run_trim_pytest(pytester)
 
-    assert emitted_lines == [
-        "test_file.py::test_problem - custom problem",
-        FAIL_MESSAGE,
-    ]
-
-
-def test_empty_longrepr_falls_back_to_unknown_error(pytester: pytest.Pytester) -> None:
-    class DummyLongrepr:
-        def __str__(self) -> str:
-            return ""
-
-    class DummyReport:
-        nodeid = "test_file.py::test_problem"
-        longrepr = DummyLongrepr()
-
-    reporter = AgentReporter(pytester.parseconfig())
-
-    assert reporter._format_issue_lines(DummyReport()) == [
-        "test_file.py::test_problem - unknown error",
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert output_lines(result) == [
+        "test_plain.py::test_fail_no_trace - Failed: plain boom",
+        FIX_FULL_LINE,
     ]
 
 
@@ -951,18 +1282,14 @@ def test_pytest11_autodiscovery_works_from_installed_dist_info(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(installed_root)
-
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", str(test_file), "--agent"],
+        [sys.executable, "-m", "pytest", "-q", str(test_file), "--trim"],
         capture_output=True,
         text=True,
-        env=env,
+        env=subprocess_env(installed_root, autoload_plugins=True),
         cwd=tmp_path,
         check=False,
     )
 
     assert result.returncode == 0
-    assert result.stdout.splitlines() == [PASS_MESSAGE]
-    assert result.stderr == ""
+    assert non_empty_lines(result.stdout)[-1] == DONE_PARTIAL_LINE
