@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import os
 import re
 import shutil
@@ -9,20 +10,23 @@ from pathlib import Path
 
 import pytest
 
+from pytest_trim.plugin import ACTION_ABORT
 from pytest_trim.plugin import ACTION_ADJUST
 from pytest_trim.plugin import ACTION_DONE
+from pytest_trim.plugin import ACTION_EXPAND
 from pytest_trim.plugin import ACTION_FIX
-from pytest_trim.plugin import ACTION_REPAIR_RUN
-from pytest_trim.plugin import ACTION_RUN_FULL
-from pytest_trim.plugin import ACTION_STOP
+from pytest_trim.plugin import ACTION_INVESTIGATE
+from pytest_trim.plugin import ACTION_REPAIR
 from pytest_trim.plugin import RUN_BROKEN
 from pytest_trim.plugin import RUN_COMPLETE
+from pytest_trim.plugin import RUN_EMPTY
 from pytest_trim.plugin import RUN_ERROR
 from pytest_trim.plugin import RUN_INTERRUPTED
-from pytest_trim.plugin import RUN_NO_TESTS
 from pytest_trim.plugin import SCOPE_FULL
 from pytest_trim.plugin import SCOPE_NONE
 from pytest_trim.plugin import SCOPE_PARTIAL
+from pytest_trim.plugin import TRIM_PREFIX
+from pytest_trim.plugin import VERDICT_BROKEN
 from pytest_trim.plugin import VERDICT_FAIL
 from pytest_trim.plugin import VERDICT_NONE
 from pytest_trim.plugin import VERDICT_PASS
@@ -32,7 +36,14 @@ from pytest_trim.plugin import render_final_line
 
 
 PLUGIN_NAME = "pytest_trim.plugin"
+ISOLATED_PYTEST_DISTRIBUTIONS = ("pytest", "pluggy", "packaging", "iniconfig", "Pygments")
 
+#def test_numpy_assert_allclose_mid_array_mismatch() -> None:
+#    import numpy as np
+#
+#    a = np.array([0.0, 1.0, 2.0], dtype=float)
+#    b = np.array([0.0, 1.0001, 2.0], dtype=float)
+#    np.testing.assert_allclose(a, b, rtol=0, atol=0)
 
 @pytest.fixture
 def local_plugin_importable(monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -66,30 +77,89 @@ def output_lines(result: pytest.RunResult) -> list[str]:
     return non_empty_lines(result.stdout.str())
 
 
+def artifact_path_from_lines(lines: list[str], root: Path) -> Path:
+    artifact_lines = [line for line in lines if line.startswith("  artifact: ")]
+    assert len(artifact_lines) == 1
+
+    artifact_text = artifact_lines[0][len("  artifact: ") :]
+    artifact_path = Path(artifact_text)
+    if artifact_path.is_absolute():
+        return artifact_path
+
+    return root / artifact_path
+
+
 def final_line(run: str, verdict: str, scope: str, action: str) -> str:
-    return f"RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+    return f"{TRIM_PREFIX}RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
 
 
 DONE_FULL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_FULL, ACTION_DONE)
 DONE_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_PARTIAL, ACTION_DONE)
-RUN_FULL_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_PARTIAL, ACTION_RUN_FULL)
+EXPAND_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_PARTIAL, ACTION_EXPAND)
 FIX_FULL_LINE = final_line(RUN_COMPLETE, VERDICT_FAIL, SCOPE_FULL, ACTION_FIX)
 FIX_PARTIAL_LINE = final_line(RUN_COMPLETE, VERDICT_FAIL, SCOPE_PARTIAL, ACTION_FIX)
-REPAIR_FULL_LINE = final_line(RUN_BROKEN, VERDICT_FAIL, SCOPE_FULL, ACTION_REPAIR_RUN)
-REPAIR_PARTIAL_LINE = final_line(RUN_BROKEN, VERDICT_FAIL, SCOPE_PARTIAL, ACTION_REPAIR_RUN)
-NO_TESTS_LINE = final_line(RUN_NO_TESTS, VERDICT_NONE, SCOPE_NONE, ACTION_ADJUST)
-ERROR_FULL_LINE = final_line(RUN_ERROR, VERDICT_UNKNOWN, SCOPE_FULL, ACTION_STOP)
-INTERRUPTED_FULL_LINE = final_line(RUN_INTERRUPTED, VERDICT_UNKNOWN, SCOPE_FULL, ACTION_STOP)
+REPAIR_FULL_LINE = final_line(RUN_BROKEN, VERDICT_BROKEN, SCOPE_FULL, ACTION_REPAIR)
+REPAIR_PARTIAL_LINE = final_line(RUN_BROKEN, VERDICT_BROKEN, SCOPE_PARTIAL, ACTION_REPAIR)
+EMPTY_LINE = final_line(RUN_EMPTY, VERDICT_NONE, SCOPE_NONE, ACTION_ADJUST)
+ERROR_FULL_LINE = final_line(RUN_ERROR, VERDICT_UNKNOWN, SCOPE_FULL, ACTION_INVESTIGATE)
+INTERRUPTED_FULL_LINE = final_line(RUN_INTERRUPTED, VERDICT_UNKNOWN, SCOPE_FULL, ACTION_ABORT)
 
 
-def subprocess_env(*pythonpaths: Path, autoload_plugins: bool = False) -> dict[str, str]:
+def _link_distribution_contents(root: Path, distribution_name: str) -> None:
+    distribution = importlib.metadata.distribution(distribution_name)
+    copied_entries: set[str] = set()
+
+    for file in distribution.files or ():
+        top_level_entry = file.parts[0]
+        if top_level_entry in copied_entries or top_level_entry in {".", ".."}:
+            continue
+
+        copied_entries.add(top_level_entry)
+        source = Path(distribution.locate_file(Path(top_level_entry)))
+        target = root / Path(top_level_entry).name
+        if target.exists():
+            continue
+
+        if source.is_dir():
+            try:
+                os.symlink(source, target, target_is_directory=True)
+            except OSError:
+                shutil.copytree(source, target)
+            continue
+
+        shutil.copy2(source, target)
+
+
+def isolated_pytest_root(tmp_path: Path) -> Path:
+    # Build a minimal import root so subprocess tests can avoid ambient site-packages.
+    root = tmp_path / "isolated-site"
+    root.mkdir()
+
+    for distribution_name in ISOLATED_PYTEST_DISTRIBUTIONS:
+        _link_distribution_contents(root, distribution_name)
+
+    return root
+
+
+def subprocess_env(
+    *pythonpaths: Path,
+    autoload_plugins: bool = False,
+    inherit_pythonpath: bool = False,
+) -> dict[str, str]:
     env = os.environ.copy()
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("PYTEST_PLUGINS", None)
 
     path_entries = [str(path) for path in pythonpaths]
-    existing = env.get("PYTHONPATH")
-    if existing:
-        path_entries.append(existing)
-    env["PYTHONPATH"] = os.pathsep.join(path_entries)
+    if inherit_pythonpath:
+        existing = env.get("PYTHONPATH")
+        if existing:
+            path_entries.append(existing)
+
+    if path_entries:
+        env["PYTHONPATH"] = os.pathsep.join(path_entries)
+    else:
+        env.pop("PYTHONPATH", None)
 
     if autoload_plugins:
         env.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
@@ -513,8 +583,12 @@ def test_plugin_is_inactive_without_trim_flag(
     )
 
     result = pytester.runpytest("-p", PLUGIN_NAME)
+    stdout = result.stdout.str()
+    stderr = result.stderr.str()
 
     assert result.ret == pytest.ExitCode.OK
+    assert TRIM_PREFIX not in stdout
+    assert TRIM_PREFIX not in stderr
     result.stdout.fnmatch_lines(["*collected 1 item*", "*test_default.py .*", "*1 passed*"])
 
 
@@ -555,7 +629,7 @@ def test_no_tests_collected_emits_no_tests_status(
     result = run_trim_pytest(pytester, "-k", "does_not_match_anything")
 
     assert result.ret == pytest.ExitCode.NO_TESTS_COLLECTED
-    assert output_lines(result) == [NO_TESTS_LINE]
+    assert output_lines(result) == [EMPTY_LINE]
 
 
 def test_no_tests_subprocess_keeps_pytest_exit_code(tmp_path: Path) -> None:
@@ -588,7 +662,7 @@ def test_no_tests_subprocess_keeps_pytest_exit_code(tmp_path: Path) -> None:
     )
 
     assert result.returncode == pytest.ExitCode.NO_TESTS_COLLECTED
-    assert non_empty_lines(result.stdout) == [NO_TESTS_LINE]
+    assert non_empty_lines(result.stdout) == [EMPTY_LINE]
 
 
 def test_last_failed_clean_rerun_requests_one_full_follow_up(
@@ -620,7 +694,7 @@ def test_last_failed_clean_rerun_requests_one_full_follow_up(
     second_result = run_trim_pytest(pytester, "--lf")
 
     assert second_result.ret == pytest.ExitCode.OK
-    assert output_lines(second_result) == [RUN_FULL_PARTIAL_LINE]
+    assert output_lines(second_result) == [EXPAND_PARTIAL_LINE]
 
 
 def test_last_failed_failure_stays_partial_fix_signal(
@@ -685,7 +759,7 @@ def test_last_failed_without_cached_failures_can_emit_no_tests(
     result = run_trim_pytest(pytester, "--lf", "--lfnf=none")
 
     assert result.ret == pytest.ExitCode.NO_TESTS_COLLECTED
-    assert output_lines(result) == [NO_TESTS_LINE]
+    assert output_lines(result) == [EMPTY_LINE]
 
 
 def test_maxfail_reports_only_seen_failures(
@@ -770,7 +844,7 @@ def test_stepwise_resume_to_end_emits_rerun_status(
     second_result = run_trim_pytest(pytester, "--sw")
 
     assert second_result.ret == pytest.ExitCode.OK
-    assert output_lines(second_result) == [RUN_FULL_PARTIAL_LINE]
+    assert output_lines(second_result) == [EXPAND_PARTIAL_LINE]
 
 
 def test_failure_reporting_works_with_ff_nf_and_x(
@@ -927,15 +1001,16 @@ def test_usage_error_does_not_claim_final_status_token(
 
     assert result.ret == pytest.ExitCode.USAGE_ERROR
     assert "unrecognized arguments: --definitely-invalid-option" in stderr
+
     for token in (
         DONE_FULL_LINE,
         DONE_PARTIAL_LINE,
-        RUN_FULL_PARTIAL_LINE,
+        EXPAND_PARTIAL_LINE,
         FIX_FULL_LINE,
         FIX_PARTIAL_LINE,
         REPAIR_FULL_LINE,
         REPAIR_PARTIAL_LINE,
-        NO_TESTS_LINE,
+        EMPTY_LINE,
         ERROR_FULL_LINE,
         INTERRUPTED_FULL_LINE,
     ):
@@ -1038,6 +1113,123 @@ def test_capture_disabled_output_still_finishes_with_final_status_token(
     assert output_lines(result) == ["TEST-OUTPUT", DONE_FULL_LINE]
 
 
+def test_failure_artifact_file_contains_traceback_and_captured_sections(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    artifacts_dir = pytester.path / "artifacts"
+    pytester.makepyfile(
+        test_fail=(
+            "import sys\n\n"
+            "def test_fail():\n"
+            "    print('HELLO-STDOUT')\n"
+            "    sys.stderr.write('HELLO-STDERR\\n')\n"
+            "    local_value = {'alpha': 1}\n"
+            "    assert local_value['alpha'] == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, f"--trim-artifacts-dir={artifacts_dir}")
+
+    lines = output_lines(result)
+    artifact_path = artifact_path_from_lines(lines, pytester.path)
+
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert artifact_path.exists()
+
+    artifact_text = artifact_path.read_text(encoding="utf-8")
+    assert "nodeid: test_fail.py::test_fail" in artifact_text
+    assert "=== longreprtext ===" in artifact_text
+    assert "assert local_value['alpha'] == 2" in artifact_text
+    assert "=== Captured stdout call ===" in artifact_text
+    assert "HELLO-STDOUT" in artifact_text
+    assert "=== Captured stderr call ===" in artifact_text
+    assert "HELLO-STDERR" in artifact_text
+    assert lines[-1] == FIX_FULL_LINE
+
+
+def test_failure_artifact_file_uses_pytest_cache_dir_by_default(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_fail=(
+            "def test_fail():\n"
+            "    assert 1 == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "--trim-artifacts")
+
+    lines = output_lines(result)
+    artifact_path = artifact_path_from_lines(lines, pytester.path)
+
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert artifact_path.exists()
+    assert ".pytest_cache" in str(artifact_path)
+    assert "pytest-trim" in str(artifact_path)
+    assert lines[-1] == FIX_FULL_LINE
+
+
+def test_failure_artifact_file_includes_locals_when_showlocals_is_enabled(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    artifacts_dir = pytester.path / "artifacts"
+    pytester.makepyfile(
+        test_fail=(
+            "def test_fail():\n"
+            "    local_value = {'alpha': 1, 'beta': [1, 2, 3]}\n"
+            "    assert local_value['alpha'] == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "-l", f"--trim-artifacts-dir={artifacts_dir}")
+
+    lines = output_lines(result)
+    artifact_path = artifact_path_from_lines(lines, pytester.path)
+
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    artifact_text = artifact_path.read_text(encoding="utf-8")
+    assert "showlocals: True" in artifact_text
+    assert "local_value = {'alpha': 1, 'beta': [1, 2, 3]}" in artifact_text
+
+
+def test_failure_artifact_file_notes_capture_disabled_under_s(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    artifacts_dir = pytester.path / "artifacts"
+    pytester.makepyfile(
+        test_fail=(
+            "def test_fail():\n"
+            "    print('LIVE-STDOUT')\n"
+            "    assert 1 == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "-s", f"--trim-artifacts-dir={artifacts_dir}")
+
+    lines = output_lines(result)
+    artifact_path = artifact_path_from_lines(lines, pytester.path)
+
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert lines[0] == "LIVE-STDOUT"
+
+    artifact_text = artifact_path.read_text(encoding="utf-8")
+    assert "capture: no" in artifact_text
+    assert "stdout/stderr capture is disabled (-s/--capture=no)." in artifact_text
+    assert "=== Captured stdout call ===" not in artifact_text
+
+
 def test_capture_disabled_stderr_output_still_finishes_with_final_status_token(
     tmp_path: Path,
 ) -> None:
@@ -1134,7 +1326,8 @@ def test_xdist_run_keeps_final_status_token(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0
-    assert non_empty_lines(result.stdout)[-1] == DONE_PARTIAL_LINE
+    assert non_empty_lines(result.stdout) == [DONE_PARTIAL_LINE]
+    assert result.stderr == ""
 
 
 def test_xdist_failure_keeps_trimmed_headline_before_final_status_token(tmp_path: Path) -> None:
@@ -1172,8 +1365,58 @@ def test_xdist_failure_keeps_trimmed_headline_before_final_status_token(tmp_path
 
     lines = non_empty_lines(result.stdout)
     assert result.returncode == pytest.ExitCode.TESTS_FAILED
-    assert re.fullmatch(r"test_fail\.py::test_one:\d+ - assert 1 == 2", lines[-2])
-    assert lines[-1] == FIX_PARTIAL_LINE
+    assert len(lines) == 2
+    assert re.fullmatch(r"test_fail\.py::test_one:\d+ - assert 1 == 2", lines[0])
+    assert lines[1] == FIX_PARTIAL_LINE
+    assert result.stderr == ""
+
+
+def test_xdist_failure_can_write_artifact_file(tmp_path: Path) -> None:
+    pytest.importorskip("xdist")
+
+    package_root = Path(__file__).resolve().parents[1]
+    artifacts_dir = tmp_path / "artifacts"
+    test_file = tmp_path / "test_fail.py"
+    test_file.write_text(
+        "def test_one():\n"
+        "    assert 1 == 2\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            PLUGIN_NAME,
+            "--trim",
+            f"--trim-artifacts-dir={artifacts_dir}",
+            "-n",
+            "2",
+            str(test_file),
+        ],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(package_root / "src"),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    lines = non_empty_lines(result.stdout)
+    artifact_path = artifact_path_from_lines(lines, tmp_path)
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED
+    assert len(lines) == 3
+    assert re.fullmatch(r"test_fail\.py::test_one:\d+ - assert 1 == 2", lines[0])
+    assert lines[1].startswith("  artifact: ")
+    assert artifact_path.exists()
+    assert "test_fail.py::test_one" in artifact_path.read_text(encoding="utf-8")
+    assert lines[2] == FIX_PARTIAL_LINE
+    assert result.stderr == ""
 
 
 def test_pytest_cov_fail_under_changes_final_status_token(
@@ -1212,10 +1455,11 @@ def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registered: list[tuple[object, str]] = []
+    reporter_created: list[object] = []
+    wrapped_writers: list[object] = []
 
     class DummyPluginManager:
         def getplugin(self, name: str) -> object | None:
-            assert name == "terminalreporter"
             return None
 
         def register(self, plugin: object, name: str) -> None:
@@ -1225,14 +1469,25 @@ def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
         pluginmanager = DummyPluginManager()
 
         def getoption(self, name: str, default: bool = False) -> bool:
-            assert name == "--trim"
-            return True
+            return {"--trim": True}.get(name, default)
+
+    def record_reporter_creation(config: object) -> object:
+        reporter_created.append(config)
+        return object()
+
+    def record_writer_wrap(writer: object) -> object:
+        wrapped_writers.append(writer)
+        return object()
 
     monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    monkeypatch.setattr("pytest_trim.plugin.TrimReporter", record_reporter_creation)
+    monkeypatch.setattr("pytest_trim.plugin.QuietTerminalWriter", record_writer_wrap)
 
     pytest_configure(DummyConfig())
 
     assert registered == []
+    assert reporter_created == []
+    assert wrapped_writers == []
 
 
 def test_pytrace_false_failure_omits_line_number_cleanly(
@@ -1261,12 +1516,31 @@ def test_pytrace_false_failure_omits_line_number_cleanly(
 def test_pytest11_autodiscovery_works_from_installed_dist_info(tmp_path: Path) -> None:
     package_root = Path(__file__).resolve().parents[1]
     src_package = package_root / "src" / "pytest_trim"
-    installed_root = tmp_path / "installed"
-    installed_package = installed_root / "pytest_trim"
-    dist_info = installed_root / "pytest_trim-0.1.0.dist-info"
+    installed_root = isolated_pytest_root(tmp_path)
     test_file = tmp_path / "test_ok.py"
 
-    shutil.copytree(src_package, installed_package)
+    test_file.write_text(
+        "def test_ok():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    missing_result = subprocess.run(
+        [sys.executable, "-S", "-m", "pytest", "-q", str(test_file), "--trim"],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(installed_root, autoload_plugins=True),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert missing_result.returncode == pytest.ExitCode.USAGE_ERROR
+    assert "unrecognized arguments: --trim" in missing_result.stderr
+    assert TRIM_PREFIX not in missing_result.stdout
+    assert TRIM_PREFIX not in missing_result.stderr
+
+    shutil.copytree(src_package, installed_root / "pytest_trim")
+    dist_info = installed_root / "pytest_trim-0.1.0.dist-info"
     dist_info.mkdir(parents=True)
     (dist_info / "METADATA").write_text(
         "Metadata-Version: 2.1\nName: pytest-trim\nVersion: 0.1.0\n",
@@ -1276,14 +1550,9 @@ def test_pytest11_autodiscovery_works_from_installed_dist_info(tmp_path: Path) -
         "[pytest11]\ntrim = pytest_trim.plugin\n",
         encoding="utf-8",
     )
-    test_file.write_text(
-        "def test_ok():\n"
-        "    assert True\n",
-        encoding="utf-8",
-    )
 
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", str(test_file), "--trim"],
+    installed_result = subprocess.run(
+        [sys.executable, "-S", "-m", "pytest", "-q", str(test_file), "--trim"],
         capture_output=True,
         text=True,
         env=subprocess_env(installed_root, autoload_plugins=True),
@@ -1291,5 +1560,6 @@ def test_pytest11_autodiscovery_works_from_installed_dist_info(tmp_path: Path) -
         check=False,
     )
 
-    assert result.returncode == 0
-    assert non_empty_lines(result.stdout)[-1] == DONE_PARTIAL_LINE
+    assert installed_result.returncode == 0
+    assert non_empty_lines(installed_result.stdout) == [DONE_PARTIAL_LINE]
+    assert installed_result.stderr == ""

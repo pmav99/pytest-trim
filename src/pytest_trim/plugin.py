@@ -4,28 +4,34 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import re
 import sys
+import uuid
 
 import pytest
 
+TRIM_PREFIX = "TRIM: "
+
 RUN_COMPLETE = "COMPLETE"
 RUN_BROKEN = "BROKEN"
-RUN_NO_TESTS = "NO_TESTS"
+RUN_EMPTY = "EMPTY"
 RUN_ERROR = "ERROR"
 RUN_INTERRUPTED = "INTERRUPTED"
 
 VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
+VERDICT_BROKEN = "BROKEN"
 VERDICT_NONE = "NONE"
 VERDICT_UNKNOWN = "UNKNOWN"
 
 ACTION_DONE = "DONE"
-ACTION_RUN_FULL = "RUN_FULL"
+ACTION_EXPAND = "EXPAND"
 ACTION_FIX = "FIX"
-ACTION_REPAIR_RUN = "REPAIR_RUN"
+ACTION_REPAIR = "REPAIR"
 ACTION_ADJUST = "ADJUST"
-ACTION_STOP = "STOP"
+ACTION_INVESTIGATE = "INVESTIGATE"
+ACTION_ABORT = "ABORT"
 
 SCOPE_FULL = "FULL"
 SCOPE_PARTIAL = "PARTIAL"
@@ -52,7 +58,7 @@ class FinalOutcome:
 
 
 def render_final_line(run: str, verdict: str, scope: str, action: str) -> str:
-    return f"RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+    return f"{TRIM_PREFIX}RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -61,6 +67,25 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Enable compact machine-friendly output format",
+    )
+    parser.addoption(
+        "--trim-artifacts",
+        action="store_true",
+        default=False,
+        help=(
+            "Write per-failure artifact files (full traceback + captured sections) and emit their paths "
+            "as 'artifact:' detail lines"
+        ),
+    )
+    parser.addoption(
+        "--trim-artifacts-dir",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Directory to write failure artifacts into. Relative paths are resolved from pytest rootdir. "
+            "Implies --trim-artifacts."
+        ),
     )
 
 
@@ -130,6 +155,9 @@ class TrimReporter:
         self._issues: list[object] = []
         self._diagnostics: list[str] = []
         self._tw = TrimTerminalWriter()
+        self._artifact_run_dir: Path | None = self._init_artifact_run_dir()
+        self._artifact_paths: dict[int, Path] = {}
+        self._artifact_write_failed = False
         self._session: pytest.Session | None = None
         self._stepwise_plugin = config.pluginmanager.getplugin("stepwiseplugin")
         self._last_failed_plugin = config.pluginmanager.getplugin("lfplugin")
@@ -217,7 +245,118 @@ class TrimReporter:
         if remaining_details > 0:
             lines.append(f"  detail: (+{remaining_details} more details omitted)")
 
+        artifact_line = self._artifact_detail_line(report)
+        if artifact_line is not None:
+            lines.append(artifact_line)
+
         return lines
+
+    def _init_artifact_run_dir(self) -> Path | None:
+        artifacts_dir = self.config.getoption("--trim-artifacts-dir", default=None)
+        enabled = bool(self.config.getoption("--trim-artifacts", default=False) or artifacts_dir)
+        if not enabled:
+            return None
+
+        try:
+            base_dir = self._resolve_artifacts_base_dir(artifacts_dir)
+            run_dir = base_dir / f"run-{uuid.uuid4().hex[:12]}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # pragma: no cover - defensive: keep trim usable even if artifacts fail
+            self._diagnostics.append(f"ARTIFACTS DISABLED: {exc}")
+            return None
+
+        return run_dir
+
+    def _resolve_artifacts_base_dir(self, configured_dir: str | None) -> Path:
+        if configured_dir:
+            base_dir = Path(configured_dir)
+            if not base_dir.is_absolute():
+                base_dir = Path(self.config.rootpath) / base_dir
+            return base_dir
+
+        cache = getattr(self.config, "cache", None)
+        if cache is not None and hasattr(cache, "mkdir"):
+            return Path(cache.mkdir("pytest-trim"))
+
+        # If pytest's cache plugin is unavailable, fall back to a conventional location.
+        return Path(self.config.rootpath) / ".pytest_cache" / "pytest-trim"
+
+    def _artifact_detail_line(self, report: pytest.CollectReport | pytest.TestReport) -> str | None:
+        if self._artifact_run_dir is None or self._artifact_write_failed:
+            return None
+
+        try:
+            artifact_path = self._write_artifact(report)
+        except Exception as exc:  # pragma: no cover - defensive: artifact writing must not break the run
+            self._artifact_write_failed = True
+            self._diagnostics.append(f"ARTIFACT WRITE FAILED: {exc}")
+            return None
+
+        return f"  artifact: {self._display_path(artifact_path)}"
+
+    def _write_artifact(self, report: pytest.CollectReport | pytest.TestReport) -> Path:
+        assert self._artifact_run_dir is not None
+
+        cache_key = id(report)
+        cached = self._artifact_paths.get(cache_key)
+        if cached is not None:
+            return cached
+
+        nodeid = getattr(report, "nodeid", "unknown")
+        when = getattr(report, "when", None) or "collect"
+        short_id = uuid.uuid4().hex[:8]
+        filename = f"{self._sanitize_nodeid(nodeid)}__{when}__{short_id}.txt"
+        artifact_path = self._artifact_run_dir / filename
+
+        lines: list[str] = []
+        lines.append(f"nodeid: {nodeid}")
+        lines.append(f"when: {when}")
+        lines.append(f"outcome: {getattr(report, 'outcome', 'failed')}")
+        lines.append(f"rootdir: {self.config.rootpath}")
+        lines.append(f"cwd: {Path.cwd()}")
+
+        capture = getattr(getattr(self.config, "option", None), "capture", None)
+        if capture is not None:
+            lines.append(f"capture: {capture}")
+
+        showlocals = getattr(getattr(self.config, "option", None), "showlocals", None)
+        if showlocals is not None:
+            lines.append(f"showlocals: {bool(showlocals)}")
+
+        lines.append("")
+        lines.append("=== longreprtext ===")
+        longreprtext = getattr(report, "longreprtext", "") or ""
+        lines.append(longreprtext.rstrip())
+
+        sections = getattr(report, "sections", None) or []
+        if sections:
+            for title, content in sections:
+                lines.append("")
+                lines.append(f"=== {title} ===")
+                lines.append((content or "").rstrip())
+        elif capture == "no":
+            lines.append("")
+            lines.append("=== note ===")
+            lines.append(
+                "stdout/stderr capture is disabled (-s/--capture=no). Printed output is not available in this artifact."
+            )
+
+        artifact_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        self._artifact_paths[cache_key] = artifact_path
+        return artifact_path
+
+    def _sanitize_nodeid(self, nodeid: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", nodeid).strip("._-")
+        if not sanitized:
+            return "report"
+        return sanitized[:180]
+
+    def _display_path(self, path: Path) -> str:
+        root = Path(self.config.rootpath)
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            return str(path)
 
     def _split_error_message(self, message: str) -> tuple[str, list[str]]:
         cleaned_lines = self._clean_message_lines(message)
@@ -350,31 +489,31 @@ class TrimReporter:
         scope = self._resolved_scope(exitstatus)
 
         if self._internal_error or exitstatus == pytest.ExitCode.INTERNAL_ERROR:
-            return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_STOP)
+            return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_INVESTIGATE)
 
         if self._keyboard_interrupt:
-            return FinalOutcome(RUN_INTERRUPTED, VERDICT_UNKNOWN, scope, ACTION_STOP)
+            return FinalOutcome(RUN_INTERRUPTED, VERDICT_UNKNOWN, scope, ACTION_ABORT)
 
         if self._no_tests_collected(exitstatus):
-            return FinalOutcome(RUN_NO_TESTS, VERDICT_NONE, SCOPE_NONE, ACTION_ADJUST)
+            return FinalOutcome(RUN_EMPTY, VERDICT_NONE, SCOPE_NONE, ACTION_ADJUST)
 
         if self._ordinary_failure(exitstatus):
             if self._behavior_failure_detected() or not self._issues:
                 return FinalOutcome(RUN_COMPLETE, VERDICT_FAIL, scope, ACTION_FIX)
 
-            return FinalOutcome(RUN_BROKEN, VERDICT_FAIL, scope, ACTION_REPAIR_RUN)
+            return FinalOutcome(RUN_BROKEN, VERDICT_BROKEN, scope, ACTION_REPAIR)
 
         if exitstatus == pytest.ExitCode.OK:
-            action = ACTION_RUN_FULL if self._successful_run_requires_full_followup() else ACTION_DONE
+            action = ACTION_EXPAND if self._successful_run_requires_full_followup() else ACTION_DONE
             return FinalOutcome(RUN_COMPLETE, VERDICT_PASS, scope, action)
 
         if exitstatus == pytest.ExitCode.INTERRUPTED:
-            return FinalOutcome(RUN_INTERRUPTED, VERDICT_UNKNOWN, scope, ACTION_STOP)
+            return FinalOutcome(RUN_INTERRUPTED, VERDICT_UNKNOWN, scope, ACTION_ABORT)
 
         if exitstatus == pytest.ExitCode.USAGE_ERROR:
-            return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_STOP)
+            return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_INVESTIGATE)
 
-        return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_STOP)
+        return FinalOutcome(RUN_ERROR, VERDICT_UNKNOWN, scope, ACTION_INVESTIGATE)
 
     def _emit_final_line(self, line: str) -> None:
         if self._final_line_emitted:
