@@ -65,6 +65,8 @@ class FakeConfig:
             "--trim": False,
             "--trim-artifacts": False,
             "--trim-artifacts-dir": None,
+            "collectonly": False,
+            "failedfirst": False,
             "stepwise": False,
             "lf": False,
             **(getoptions or {}),
@@ -298,32 +300,55 @@ def test_lineno_and_error_parts_support_all_repr_shapes(tmp_path: Path) -> None:
 def test_message_cleaning_and_detail_helpers(tmp_path: Path) -> None:
     reporter, _ = make_reporter(tmp_path)
 
-    assert reporter._clean_message_lines(
-        "\nkeep me\nUse -v to get more diff\nFull diff:\nignore me\n"
-    ) == ["keep me"]
-    assert reporter._split_error_message("") == ("unknown error", [])
     assert reporter._split_error_message(
-        "AssertionError: assert left == right\nlabel:\na\nb"
-    ) == ("assert left == right", ["label: a | b"])
+        "\n"
+        "  \n"
+        "Use -v to get more diff\n"
+        "Full diff:\n"
+        "ignored"
+    ) == ("unknown error", [])
 
-    assert reporter._format_detail_lines([]) == []
-    assert reporter._format_detail_lines(["- left", "+ right", "- three"]) == [
-        "- left | + right",
-        "- three",
+    noise_report = SimpleNamespace(
+        nodeid="test_demo.py::test_case",
+        longrepr=(
+            "demo.py",
+            8,
+            "AssertionError: assert left == right\n"
+            "Use -v to get more diff\n"
+            "label:\n"
+            "a\n"
+            "b\n"
+            "Full diff:\n"
+            "ignore me",
+        ),
+    )
+    assert reporter._format_issue_lines(noise_report) == [
+        "test_demo.py::test_case:8 - assert left == right",
+        "  detail: label: a | b",
     ]
-    assert reporter._format_detail_lines(["first", "label:", "value"]) == ["first", "label: value"]
+
+    diff_report = SimpleNamespace(
+        nodeid="test_demo.py::test_case",
+        longrepr=("demo.py", 8, "AssertionError: assert left == right\n- left\n+ right\n- three"),
+    )
+    assert reporter._format_issue_lines(diff_report) == [
+        "test_demo.py::test_case:8 - assert left == right",
+        "  detail: - left | + right",
+        "  detail: - three",
+    ]
+
+    complex_label_report = SimpleNamespace(
+        nodeid="test_demo.py::test_case",
+        longrepr=("demo.py", 8, "AssertionError: assert left == right\nlabel:\nshort\nx != y"),
+    )
+    assert reporter._format_issue_lines(complex_label_report) == [
+        "test_demo.py::test_case:8 - assert left == right",
+        "  detail: label: short",
+        "  detail: label: x != y",
+    ]
 
     assert reporter._expand_labeled_details("label:", []) == ["label:"]
-    assert reporter._expand_labeled_details("label:", ["one"]) == ["label: one"]
-    assert reporter._expand_labeled_details("label:", ["a", "b"]) == ["label: a | b"]
-    assert reporter._expand_labeled_details("label:", ["short", "x != y"]) == [
-        "label: short",
-        "label: x != y",
-    ]
-    assert reporter._is_complex_detail("x != y") is True
-    assert reporter._is_complex_detail("short") is False
-    assert reporter._is_label_line("label:") is True
-    assert reporter._is_label_line("- not a label") is False
+    assert reporter._expand_labeled_details("label:", ["only"]) == ["label: only"]
 
 
 def test_issue_line_formatting_caps_details_and_appends_artifact(
@@ -331,14 +356,11 @@ def test_issue_line_formatting_caps_details_and_appends_artifact(
     tmp_path: Path,
 ) -> None:
     reporter, _ = make_reporter(tmp_path)
-    report = SimpleNamespace(nodeid="test_demo.py::test_case")
-
-    monkeypatch.setattr(reporter, "_get_lineno", lambda report: 9)
-    monkeypatch.setattr(
-        reporter,
-        "_get_error_message_parts",
-        lambda report: ("RuntimeError: boom", ["one", "two", "three"]),
+    report = SimpleNamespace(
+        nodeid="test_demo.py::test_case",
+        longrepr=("demo.py", 9, "RuntimeError: boom\none\ntwo\nthree"),
     )
+
     monkeypatch.setattr(reporter, "_artifact_detail_line", lambda report: "  artifact: demo.txt")
     assert reporter._format_issue_lines(report) == [
         "test_demo.py::test_case:9 - RuntimeError: boom",
@@ -348,9 +370,16 @@ def test_issue_line_formatting_caps_details_and_appends_artifact(
         "  artifact: demo.txt",
     ]
 
-    monkeypatch.setattr(reporter, "_get_lineno", lambda report: None)
+    no_lineno_report = SimpleNamespace(
+        nodeid="test_demo.py::test_case",
+        longrepr=SimpleNamespace(
+            chain=[
+                (None, SimpleNamespace(message="RuntimeError: boom\none\ntwo\nthree"), None),
+            ]
+        ),
+    )
     monkeypatch.setattr(reporter, "_artifact_detail_line", lambda report: None)
-    assert reporter._format_issue_lines(report) == [
+    assert reporter._format_issue_lines(no_lineno_report) == [
         "test_demo.py::test_case - RuntimeError: boom",
         "  detail: one",
         "  detail: two",
@@ -529,6 +558,17 @@ def test_emitters_and_unconfigure_are_idempotent(monkeypatch: pytest.MonkeyPatch
     configured.pytest_terminal_summary(object(), 0, config)
     assert calls == ["issues", plugin.render_final_line("COMPLETE", "PASS", "FULL", "DONE")]
 
+    collect_only, collect_only_config = make_reporter(tmp_path, getoptions={"collectonly": True})
+    collect_only_calls: list[str] = []
+    monkeypatch.setattr(collect_only, "_emit_issues", lambda: collect_only_calls.append("issues"))
+    monkeypatch.setattr(
+        collect_only,
+        "_final_outcome",
+        lambda: pytest.fail("collect-only runs must not compute a final protocol line"),
+    )
+    collect_only.pytest_unconfigure(collect_only_config)
+    assert collect_only_calls == ["issues"]
+
     finished, config = make_reporter(tmp_path)
     finished._final_line_emitted = True
     finished.pytest_unconfigure(config)
@@ -552,10 +592,10 @@ def test_selection_followup_and_scope_helpers(tmp_path: Path) -> None:
     selection_reporter, _ = make_reporter(
         tmp_path,
         option_attrs={
-            "file_or_dir": ["tests/test_plugin.py"],
+            "file_or_dir": ["tests/test_scope_selection.py"],
             "keyword": "name",
             "markexpr": "slow",
-            "deselect": ["tests/test_plugin.py::test_case"],
+            "deselect": ["tests/test_scope_selection.py::test_case"],
         },
     )
     selection_reporter.stats["deselected"] = [object()]
@@ -601,6 +641,14 @@ def test_selection_followup_and_scope_helpers(tmp_path: Path) -> None:
     )
     assert rerun_reporter._reran_previous_failures() is True
     assert rerun_reporter._successful_run_requires_full_followup() is True
+
+    failedfirst_reporter, _ = make_reporter(
+        tmp_path,
+        getoptions={"failedfirst": True},
+        plugins={"lfplugin": rerun_plugin},
+    )
+    assert failedfirst_reporter._reran_previous_failures() is False
+    assert failedfirst_reporter._successful_run_requires_full_followup() is False
 
     report = make_test_report(outcome="failed", longrepr="boom", when="call")
     rerun_reporter._issues = [report]

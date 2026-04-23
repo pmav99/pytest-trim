@@ -139,7 +139,7 @@ Current values:
 - `SCOPE=NONE` means zero tests were selected to run.
 
 - `ACTION=DONE` means no follow-up pytest command is needed.
-- `ACTION=EXPAND` means a failure-replay subset (`--lf`, `--ff`, `--sw`,
+- `ACTION=EXPAND` means a failure-replay subset (`--lf`, `--sw`,
   `--stepwise`) passed; re-invoke against the full suite to confirm nothing
   else regressed.
 - `ACTION=FIX` means a meaningful behavior-level failure occurred; fix the
@@ -166,8 +166,11 @@ Notes:
 - Skips, xfails, non-strict xpasses, and deselections do not produce per-test
   output lines.
 - Strict xpasses are treated as failures because pytest treats them as failures.
-- Output written through pytest's terminal reporter stays hidden, including
-  terminal-summary hooks that call `terminalreporter.write_line(...)`.
+- Output written through pytest's terminal reporter stays hidden by default,
+  including terminal-summary hooks that call
+  `terminalreporter.write_line(...)`.
+- `pytest-cov` terminal coverage sections are replayed before the final
+  protocol line, so `pytest --trim --cov=...` still shows the coverage report.
 - Direct writes to stdout/stderr, such as `print(...)` in tests or hooks, may
   still appear before the final protocol line.
 - Artifact files include pytest's `longreprtext` and captured sections when
@@ -175,6 +178,10 @@ Notes:
   the traceback, but uncaptured stdout/stderr cannot be reconstructed.
 - The final protocol line is the authoritative machine-readable result for the
   run.
+- `pytest --trim --collect-only` suppresses the final protocol line because
+  collection is not a behavior run.
+- `--ff` reorders a full run; by itself it still reports `SCOPE=FULL` and, on
+  pass, `ACTION=DONE`.
 - CLI usage errors and very-early startup/configuration failures can happen
   before the plugin takes over terminal reporting; in those cases pytest may
   emit raw diagnostic output instead of a final protocol line.

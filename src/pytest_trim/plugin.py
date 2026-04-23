@@ -468,12 +468,14 @@ class TrimReporter:
 
     @pytest.hookimpl(trylast=True)
     def pytest_unconfigure(self, config: pytest.Config) -> None:
-        del config
-
         if self._final_line_emitted:
             return
 
         self._emit_issues()
+        if self._protocol_line_suppressed(config):
+            return
+
+        self._emit_compatible_terminal_summaries()
         self._emit_final_line(self._final_outcome().render())
 
     def pytest_terminal_summary(
@@ -534,6 +536,43 @@ class TrimReporter:
                 self._tw.line(line)
 
         self._issues_emitted = True
+
+    def _emit_compatible_terminal_summaries(self) -> None:
+        self._emit_pytest_cov_terminal_summary()
+
+    def _emit_pytest_cov_terminal_summary(self) -> None:
+        terminal_reporter = self.config.pluginmanager.getplugin("terminalreporter")
+        if terminal_reporter is None:
+            return
+
+        quiet_writer = getattr(terminal_reporter, "_tw", None)
+        if not isinstance(quiet_writer, QuietTerminalWriter):
+            return
+
+        cov_plugin = self.config.pluginmanager.getplugin("_cov")
+        if cov_plugin is None:
+            return
+
+        summary = getattr(cov_plugin, "pytest_terminal_summary", None)
+        if not callable(summary):
+            return
+
+        had_heading_flag = hasattr(cov_plugin, "_wrote_heading")
+        previous_heading_flag = getattr(cov_plugin, "_wrote_heading", False)
+        terminal_reporter._tw = quiet_writer._wrapped
+        try:
+            if had_heading_flag:
+                cov_plugin._wrote_heading = False
+            summary(terminal_reporter)
+        except Exception as exc:  # pragma: no cover - compatibility replay must not break trim runs
+            self._tw.line(f"COVERAGE SUMMARY REPLAY FAILED: {exc}")
+        finally:
+            if had_heading_flag:
+                cov_plugin._wrote_heading = previous_heading_flag
+            terminal_reporter._tw = quiet_writer
+
+    def _protocol_line_suppressed(self, config: pytest.Config) -> bool:
+        return bool(config.getoption("collectonly", default=False))
 
     def _final_exitstatus(self) -> int:
         if self._session is None:

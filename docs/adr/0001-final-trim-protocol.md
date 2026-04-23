@@ -104,6 +104,7 @@ Examples:
 | Example | `SCOPE` |
 | --- | --- |
 | plain `pytest --trim` | `FULL` |
+| `pytest --trim --ff` rerunning previous failures first | `FULL` |
 | `pytest --trim -k expr` | `PARTIAL` |
 | `pytest --trim some_test.py` | `PARTIAL` |
 | `pytest --trim --lf` rerunning previous failures | `PARTIAL` |
@@ -130,7 +131,7 @@ an agent can route entirely on `ACTION`; the other fields are diagnostics.
 | Value | Meaning |
 | --- | --- |
 | `DONE` | Successful run. No follow-up needed. |
-| `EXPAND` | A failure-replay subset (`--lf`, `--ff`, `--sw`, `--stepwise`) passed. Re-invoke `pytest --trim` against the full suite to confirm nothing else regressed. |
+| `EXPAND` | A failure-replay subset (`--lf`, `--sw`, `--stepwise`) passed. Re-invoke `pytest --trim` against the full suite to confirm nothing else regressed. |
 | `FIX` | A meaningful behavior-level failure occurred. Fix the failing behavior. |
 | `REPAIR` | The run did not yet provide a usable behavior verdict; restore runnability first (fix imports, syntax, fixtures, config). |
 | `ADJUST` | The selector or invocation needs editing (typo, over-narrow filter, wrong path). |
@@ -141,9 +142,12 @@ an agent can route entirely on `ACTION`; the other fields are diagnostics.
 
 `ACTION=EXPAND` is emitted only when the selection mode is a **failure-replay
 shortcut** — i.e. the subset is derived from cached failures from a prior
-run. Specifically: `--lf`, `--ff`, `--sw`, `--stepwise`. Passing such a
+run. Specifically: `--lf`, `--sw`, `--stepwise`. Passing such a
 subset does not constitute a green verdict for the suite, so a follow-up
 full run is required.
+
+By contrast, `--ff` only reorders a full run. It keeps `SCOPE=FULL` and, on
+pass, emits `ACTION=DONE`.
 
 All other partial selections (explicit `-k`, file path, node id, marker
 expression, impact-based modes like `testmon`) emit `ACTION=DONE` on pass,
@@ -239,7 +243,7 @@ outside this table is a protocol bug.
 | --- | --- | --- | --- | --- |
 | `COMPLETE` | `PASS` | `FULL` | `DONE` | full suite green |
 | `COMPLETE` | `PASS` | `PARTIAL` | `DONE` | explicit subset green (`-k`, file, node id, marker, `testmon`) |
-| `COMPLETE` | `PASS` | `PARTIAL` | `EXPAND` | failure-replay subset green (`--lf`, `--ff`, `--sw`, `--stepwise`) |
+| `COMPLETE` | `PASS` | `PARTIAL` | `EXPAND` | failure-replay subset green (`--lf`, `--sw`, `--stepwise`) |
 | `COMPLETE` | `FAIL` | `FULL` \| `PARTIAL` | `FIX` | behavior failure |
 | `BROKEN` | `BROKEN` | `FULL` \| `PARTIAL` | `REPAIR` | collection / import / fixture / config broke run |
 | `EMPTY` | `NONE` | `NONE` | `ADJUST` | selection resolved to zero |
