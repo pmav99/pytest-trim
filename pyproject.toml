@@ -26,7 +26,37 @@ build-backend = "poetry.core.masonry.api"
 
 [dependency-groups]
 dev = [
-    "pytest-xdist",
+    "coverage",
+    "pytest",
     "pytest-cov",
-    "poetry-core"
+    "pytest-xdist",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["pytest_trim"]
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    'def __repr__',
+    'if self.debug:',
+    'if settings.DEBUG',
+    'raise AssertionError',
+    'raise NotImplementedError',
+    'if 0:',
+    'if __name__ == .__main__.:',
+    'if TYPE_CHECKING:',
+    'if T\.TYPE_CHECKING:',
+    'if ty.TYPE_CHECKING:',
+    'if typing\.TYPE_CHECKING:',
+    'class .*\bProtocol\):',
+    '@(abc\.)?abstractmethod',
+    # Comments to turn coverage on and off:
+    'no cover: start(?s:.)*?no cover: stop',
+    # A pragma comment that excludes an entire file:
+    '\A(?s:.*# pragma: exclude file.*)\Z',
+]
+fail_under = 100
