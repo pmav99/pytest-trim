@@ -107,6 +107,8 @@ def pytest_configure(config: pytest.Config) -> None:
 class QuietTerminalWriter:
     """Terminal writer proxy that suppresses visible output while preserving API access."""
 
+    _trim_quiet_writer = True
+
     def __init__(self, wrapped: object) -> None:
         self._wrapped = wrapped
 
@@ -546,7 +548,11 @@ class TrimReporter:
             return
 
         quiet_writer = getattr(terminal_reporter, "_tw", None)
-        if not isinstance(quiet_writer, QuietTerminalWriter):
+        if not getattr(quiet_writer, "_trim_quiet_writer", False):
+            return
+
+        wrapped_writer = getattr(quiet_writer, "_wrapped", None)
+        if wrapped_writer is None:
             return
 
         cov_plugin = self.config.pluginmanager.getplugin("_cov")
@@ -559,7 +565,7 @@ class TrimReporter:
 
         had_heading_flag = hasattr(cov_plugin, "_wrote_heading")
         previous_heading_flag = getattr(cov_plugin, "_wrote_heading", False)
-        terminal_reporter._tw = quiet_writer._wrapped
+        terminal_reporter._tw = wrapped_writer
         try:
             if had_heading_flag:
                 cov_plugin._wrote_heading = False

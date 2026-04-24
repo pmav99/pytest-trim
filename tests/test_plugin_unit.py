@@ -192,6 +192,7 @@ def test_terminal_writer_helpers_are_quiet(monkeypatch: pytest.MonkeyPatch) -> N
     quiet = plugin.QuietTerminalWriter(wrapped)
 
     assert quiet.marker == "wrapped"
+    assert quiet._trim_quiet_writer is True
     quiet.write("hidden", flush=True, red=True)
     quiet.line("hidden", yellow=True)
     quiet.sep("-", "title", fullwidth=5, blue=True)
@@ -218,6 +219,114 @@ def test_terminal_writer_helpers_are_quiet(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert fake_stdout.buffer == ["visible\n"]
     assert fake_stdout.flushed is True
+
+
+def test_cov_summary_replay_survives_module_reload_identity_mismatch(tmp_path: Path) -> None:
+    class WrappedWriter:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, str]] = []
+
+        def write(self, content: str, **kwargs: object) -> None:
+            del kwargs
+            self.events.append(("write", content))
+
+        def write_sep(self, sep: str, title: str) -> None:
+            self.events.append(("sep", f"{sep}:{title}"))
+
+    class TerminalReporter:
+        def __init__(self, writer: object) -> None:
+            self._tw = writer
+
+        def write(self, content: str, **kwargs: object) -> None:
+            self._tw.write(content, **kwargs)
+
+        def write_sep(self, sep: str, title: str) -> None:
+            self._tw.write_sep(sep, title)
+
+    old_quiet_writer_type = plugin.QuietTerminalWriter
+    wrapped_writer = WrappedWriter()
+    quiet_writer = old_quiet_writer_type(wrapped_writer)
+    reloaded = importlib.reload(plugin)
+
+    def emit_cov_summary(terminalreporter: object) -> None:
+        terminalreporter.write_sep("=", "tests coverage")
+        terminalreporter.write("TOTAL 1 0 100%\n")
+
+    cov_plugin = SimpleNamespace(_wrote_heading=True, pytest_terminal_summary=emit_cov_summary)
+    terminal_reporter = TerminalReporter(quiet_writer)
+    config = FakeConfig(tmp_path, plugins={"terminalreporter": terminal_reporter, "_cov": cov_plugin})
+    reporter = reloaded.TrimReporter(config)
+
+    reporter._emit_pytest_cov_terminal_summary()
+
+    assert wrapped_writer.events == [("sep", "=:tests coverage"), ("write", "TOTAL 1 0 100%\n")]
+    assert terminal_reporter._tw is quiet_writer
+    assert cov_plugin._wrote_heading is True
+
+
+@pytest.mark.parametrize(
+    ("writer", "cov_plugin"),
+    [
+        (object(), SimpleNamespace(pytest_terminal_summary=lambda _: None)),
+        (SimpleNamespace(_trim_quiet_writer=True), SimpleNamespace(pytest_terminal_summary=lambda _: None)),
+        (
+            SimpleNamespace(_trim_quiet_writer=True, _wrapped=object()),
+            SimpleNamespace(pytest_terminal_summary=None),
+        ),
+    ],
+)
+def test_cov_summary_replay_skips_incompatible_replay_targets(
+    tmp_path: Path,
+    writer: object,
+    cov_plugin: object,
+) -> None:
+    terminal_reporter = SimpleNamespace(_tw=writer)
+    config = FakeConfig(tmp_path, plugins={"terminalreporter": terminal_reporter, "_cov": cov_plugin})
+    reporter = plugin.TrimReporter(config)
+
+    reporter._emit_pytest_cov_terminal_summary()
+
+    assert terminal_reporter._tw is writer
+
+
+def test_cov_summary_replay_handles_cov_plugins_without_heading_flag(tmp_path: Path) -> None:
+    class WrappedWriter:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, str]] = []
+
+        def write(self, content: str, **kwargs: object) -> None:
+            del kwargs
+            self.events.append(("write", content))
+
+        def write_sep(self, sep: str, title: str) -> None:
+            self.events.append(("sep", f"{sep}:{title}"))
+
+    class TerminalReporter:
+        def __init__(self, writer: object) -> None:
+            self._tw = writer
+
+        def write(self, content: str, **kwargs: object) -> None:
+            self._tw.write(content, **kwargs)
+
+        def write_sep(self, sep: str, title: str) -> None:
+            self._tw.write_sep(sep, title)
+
+    def emit_cov_summary(terminalreporter: object) -> None:
+        terminalreporter.write_sep("-", "headingless coverage")
+        terminalreporter.write("TOTAL 1 0 100%\n")
+
+    wrapped_writer = WrappedWriter()
+    quiet_writer = plugin.QuietTerminalWriter(wrapped_writer)
+    terminal_reporter = TerminalReporter(quiet_writer)
+    cov_plugin = SimpleNamespace(pytest_terminal_summary=emit_cov_summary)
+    config = FakeConfig(tmp_path, plugins={"terminalreporter": terminal_reporter, "_cov": cov_plugin})
+    reporter = plugin.TrimReporter(config)
+
+    reporter._emit_pytest_cov_terminal_summary()
+
+    assert wrapped_writer.events == [("sep", "-:headingless coverage"), ("write", "TOTAL 1 0 100%\n")]
+    assert terminal_reporter._tw is quiet_writer
+    assert not hasattr(cov_plugin, "_wrote_heading")
 
 
 def test_report_collection_and_misc_hooks(tmp_path: Path) -> None:
