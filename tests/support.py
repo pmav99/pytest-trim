@@ -30,7 +30,7 @@ from pytest_trim.plugin import VERDICT_PASS
 from pytest_trim.plugin import VERDICT_UNKNOWN
 
 
-PLUGIN_NAME = "pytest_trim.plugin"
+PLUGIN_NAME = "pytest_trim_bootstrap"
 ISOLATED_PYTEST_DISTRIBUTIONS = ("pytest", "pluggy", "packaging", "iniconfig", "Pygments")
 
 

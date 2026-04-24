@@ -12,11 +12,12 @@ dependencies = [
 ]
 
 [project.entry-points.pytest11]
-trim = "pytest_trim.plugin"
+trim = "pytest_trim_bootstrap"
 
 [tool.poetry]
 packages = [
     {include = "pytest_trim", from = "src"},
+    {include = "pytest_trim_bootstrap", from = "src"},
 ]
 
 

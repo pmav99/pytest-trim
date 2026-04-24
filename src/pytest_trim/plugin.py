@@ -10,6 +10,7 @@ import sys
 import uuid
 
 import pytest
+from pytest_trim_bootstrap.options import add_trim_options
 
 TRIM_PREFIX = "TRIM: "
 
@@ -62,36 +63,15 @@ def render_final_line(run: str, verdict: str, scope: str, action: str) -> str:
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--trim",
-        action="store_true",
-        default=False,
-        help="Enable compact machine-friendly output format",
-    )
-    parser.addoption(
-        "--trim-artifacts",
-        action="store_true",
-        default=False,
-        help=(
-            "Write per-failure artifact files (full traceback + captured sections) and emit their paths "
-            "as 'artifact:' detail lines"
-        ),
-    )
-    parser.addoption(
-        "--trim-artifacts-dir",
-        action="store",
-        default=None,
-        metavar="PATH",
-        help=(
-            "Directory to write failure artifacts into. Relative paths are resolved from pytest rootdir. "
-            "Implies --trim-artifacts."
-        ),
-    )
+    add_trim_options(parser)
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_configure(config: pytest.Config) -> None:
     if not config.getoption("--trim", default=False):
+        return
+
+    if config.pluginmanager.getplugin("trimreporter") is not None:
         return
 
     terminal_reporter = config.pluginmanager.getplugin("terminalreporter")

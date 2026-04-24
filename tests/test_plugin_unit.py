@@ -175,6 +175,19 @@ def test_pytest_configure_respects_trim_and_xdist(monkeypatch: pytest.MonkeyPatc
     assert enabled.pluginmanager.registered
     assert enabled.pluginmanager.registered[0][1] == "trimreporter"
 
+    already_registered_terminal = SimpleNamespace(_tw=object())
+    already_registered = FakeConfig(
+        tmp_path,
+        getoptions={"--trim": True},
+        plugins={
+            "terminalreporter": already_registered_terminal,
+            "trimreporter": object(),
+        },
+    )
+    plugin.pytest_configure(already_registered)
+    assert already_registered.pluginmanager.registered == []
+    assert not isinstance(already_registered_terminal._tw, plugin.QuietTerminalWriter)
+
     no_terminal = FakeConfig(tmp_path, getoptions={"--trim": True})
     plugin.pytest_configure(no_terminal)
     assert len(no_terminal.pluginmanager.registered) == 1

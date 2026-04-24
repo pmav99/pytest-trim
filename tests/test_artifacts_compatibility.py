@@ -358,6 +358,8 @@ def test_pytest_cov_terminal_summary_is_visible_before_final_status_token(
     )
 
     lines = output_lines(result)
+    stdout = result.stdout.str()
+    stderr = result.stderr.str()
 
     assert result.ret == pytest.ExitCode.OK
     assert lines[-1] == DONE_FULL_LINE
@@ -365,6 +367,8 @@ def test_pytest_cov_terminal_summary_is_visible_before_final_status_token(
     assert any(line.startswith("Name") and "Cover" in line for line in lines[:-1])
     assert any("thing.py" in line and "%" in line for line in lines[:-1])
     assert any(line.startswith("TOTAL") and "%" in line for line in lines[:-1])
+    assert "previously imported, but not measured" not in stdout
+    assert "previously imported, but not measured" not in stderr
 
 
 def test_pytest_cov_fail_under_changes_final_status_token(
@@ -396,11 +400,15 @@ def test_pytest_cov_fail_under_changes_final_status_token(
     )
 
     lines = output_lines(result)
+    stdout = result.stdout.str()
+    stderr = result.stderr.str()
 
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     assert lines[-1] == FIX_FULL_LINE
     assert any("tests coverage" in line for line in lines[:-1])
     assert any("Required test coverage of 100" in line and "not reached" in line for line in lines[:-1])
+    assert "previously imported, but not measured" not in stdout
+    assert "previously imported, but not measured" not in stderr
 
 
 def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
@@ -475,8 +483,9 @@ def test_pytest11_autodiscovery_works_from_installed_dist_info(tmp_path: Path) -
         "Metadata-Version: 2.1\nName: pytest-trim\nVersion: 0.1.0\n",
         encoding="utf-8",
     )
+    shutil.copytree(package_root / "src" / "pytest_trim_bootstrap", installed_root / "pytest_trim_bootstrap")
     (dist_info / "entry_points.txt").write_text(
-        "[pytest11]\ntrim = pytest_trim.plugin\n",
+        "[pytest11]\ntrim = pytest_trim_bootstrap\n",
         encoding="utf-8",
     )
 
