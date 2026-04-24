@@ -69,7 +69,7 @@ Describes what broad kind of run termination happened.
 
 | Value | Meaning |
 | --- | --- |
-| `COMPLETE` | The run produced a usable behavior verdict, including both green runs and ordinary red behavior failures. |
+| `COMPLETE` | The run produced a usable completed verdict, including both green runs and user-fixable red outcomes that still produced a trustworthy result. |
 | `BROKEN` | The run failed in a recognized run-viability way (collection error, import failure, fixture setup, config error). The next step is to repair the run before trusting it for behavior verification. |
 | `EMPTY` | Selection resolved to zero tests. Covers both selectors that matched nothing and runs where no tests were defined. |
 | `ERROR` | Pytest, a plugin, or the protocol machinery failed abnormally. Output may be unreliable. |
@@ -83,7 +83,7 @@ alone for green/red triage, without consulting `RUN`.
 | Value | Meaning |
 | --- | --- |
 | `PASS` | The run produced a green behavior verdict. |
-| `FAIL` | A behavior failure was observed (assertion, unexpected exception, strict xpass, warnings-as-errors triggered). |
+| `FAIL` | The run completed red in a user-fixable way (assertion, unexpected exception, strict xpass, warnings-as-errors triggered, or a run-complete policy gate such as `pytest-cov --cov-fail-under`). |
 | `BROKEN` | No behavior verdict was produced because run viability was lost (collection / import / fixture / config). |
 | `NONE` | No behavior verdict applies because no tests were selected. |
 | `UNKNOWN` | No trustworthy verdict can be derived (runner crash, external interrupt). |
@@ -185,8 +185,8 @@ Mnemonic:
 
 ### `FIX` vs `REPAIR`
 
-Use `ACTION=FIX` when the run told us something meaningful about behavior
-and the result was red.
+Use `ACTION=FIX` when the run completed and told us something meaningful and
+user-fixable about the red result.
 
 Typical `FIX` cases:
 
@@ -194,6 +194,7 @@ Typical `FIX` cases:
 - unexpected exception in the test call phase
 - strict `XPASS`
 - warnings-as-errors (`-W error::X`) triggered during a test
+- unmet `pytest-cov --cov-fail-under` threshold with otherwise passing tests
 
 Use `ACTION=REPAIR` when the red result does not yet provide a usable
 behavior verdict and the run must be made viable first.
@@ -209,7 +210,7 @@ Typical `REPAIR` cases:
 
 Mnemonic:
 
-- `FIX` = fix behavior
+- `FIX` = fix the actionable red result
 - `REPAIR` = repair the run
 
 ### `INVESTIGATE` vs `ABORT`
@@ -229,10 +230,13 @@ When multiple failure modes occur in the same run, classify in this order
 3. at least one meaningful call-phase behavior failure (assertion,
    exception, strict xpass) → `RUN=COMPLETE VERDICT=FAIL ACTION=FIX`,
    even if teardown or collection of unrelated tests also failed
-4. otherwise, if any collection / import / fixture / config failure
+4. otherwise, if the run still completed with a user-fixable red gate such as
+   a pure `pytest-cov --cov-fail-under` failure →
+   `RUN=COMPLETE VERDICT=FAIL ACTION=FIX`
+5. otherwise, if any collection / import / fixture / config failure
    prevented behavior verdicts for all selected tests → `RUN=BROKEN`
-5. all selected tests passed → `RUN=COMPLETE VERDICT=PASS`
-6. zero tests selected → `RUN=EMPTY`
+6. all selected tests passed → `RUN=COMPLETE VERDICT=PASS`
+7. zero tests selected → `RUN=EMPTY`
 
 ## Legal combinations
 
@@ -244,7 +248,7 @@ outside this table is a protocol bug.
 | `COMPLETE` | `PASS` | `FULL` | `DONE` | full suite green |
 | `COMPLETE` | `PASS` | `PARTIAL` | `DONE` | explicit subset green (`-k`, file, node id, marker, `testmon`) |
 | `COMPLETE` | `PASS` | `PARTIAL` | `EXPAND` | failure-replay subset green (`--lf`, `--sw`, `--stepwise`) |
-| `COMPLETE` | `FAIL` | `FULL` \| `PARTIAL` | `FIX` | behavior failure |
+| `COMPLETE` | `FAIL` | `FULL` \| `PARTIAL` | `FIX` | behavior failure or other user-fixable completed red gate |
 | `BROKEN` | `BROKEN` | `FULL` \| `PARTIAL` | `REPAIR` | collection / import / fixture / config broke run |
 | `EMPTY` | `NONE` | `NONE` | `ADJUST` | selection resolved to zero |
 | `ERROR` | `UNKNOWN` | `FULL` \| `PARTIAL` \| `NONE` | `INVESTIGATE` | runner / plugin / protocol crash |
@@ -258,7 +262,7 @@ outside this table is a protocol bug.
 | --- | --- |
 | `DONE` | Exit success; no further pytest invocation. |
 | `EXPAND` | Re-invoke `pytest --trim` against the full suite. |
-| `FIX` | Edit code under test to address the behavior failure; retry. |
+| `FIX` | Address the actionable red result, then retry. |
 | `REPAIR` | Edit imports / config / fixtures / syntax to restore runnability; retry. |
 | `ADJUST` | Revise the selector (fix typo, broaden filter, correct path); retry. |
 | `INVESTIGATE` | Stop automation; escalate to a human or higher-capability agent. |
@@ -273,6 +277,9 @@ and humans reading output. They are not required for routing.
 - **`pytest-xdist`**: only the coordinator emits; workers stay silent.
 - **Warnings-as-errors** (`-W error::X`) triggered in a test: classified
   as a call-phase failure → `ACTION=FIX`.
+- **`pytest-cov --cov-fail-under`** with otherwise passing tests:
+  `RUN=COMPLETE VERDICT=FAIL ACTION=FIX`; the replayed coverage summary before
+  the final line explains the unmet threshold.
 - **Non-strict xpass**: pytest treats as pass; protocol reports
   `VERDICT=PASS`.
 - **Selector matched nothing vs no tests defined**: both → `RUN=EMPTY`.

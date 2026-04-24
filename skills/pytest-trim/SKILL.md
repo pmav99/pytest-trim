@@ -131,7 +131,8 @@ Field meanings:
 ### Current `VERDICT` Values
 
 - `PASS`: green behavior verdict.
-- `FAIL`: behavior failure observed.
+- `FAIL`: completed red result observed. This includes behavior failures and
+  run-complete policy gates such as pure coverage-threshold failures.
 - `BROKEN`: run viability was lost; no behavior verdict produced.
 - `NONE`: no tests were selected.
 - `UNKNOWN`: no trustworthy verdict can be derived.
@@ -149,7 +150,8 @@ Field meanings:
 - `DONE`: successful run; no follow-up needed.
 - `EXPAND`: a failure-replay subset (`--lf`, `--ff`, `--sw`, `--stepwise`)
   passed; re-invoke against the full suite to confirm nothing else regressed.
-- `FIX`: a meaningful behavior-level failure occurred; fix the behavior.
+- `FIX`: a meaningful user-fixable red result occurred; fix the behavior or
+  unmet gate.
 - `REPAIR`: the run has no usable verdict yet; restore runnability first
   (imports, syntax, fixtures, config).
 - `ADJUST`: the selector or invocation needs editing.
@@ -159,9 +161,13 @@ Field meanings:
 ## Operating Guidance
 
 - Parse the last non-empty line first; anchor on the `TRIM: ` prefix.
-- If `ACTION=FIX`, use the preceding issue lines as the actionable failures.
-  This includes both broken product behavior and broken test behavior, such as
-  stale assertions, wrong expected values, or buggy test helpers.
+- If `ACTION=FIX` and issue lines are present, use them as the actionable
+  failures. This includes both broken product behavior and broken test
+  behavior, such as stale assertions, wrong expected values, or buggy test
+  helpers.
+- If `ACTION=FIX` and no issue lines are present, inspect replayed plugin
+  summary text before the final line. Pure `pytest-cov --cov-fail-under`
+  failures currently work this way.
 - If `ACTION=REPAIR`, repair the run first, then rerun the same pytest
   command.
 - If `ACTION=EXPAND`, run one final full verification pass next.

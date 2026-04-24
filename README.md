@@ -111,8 +111,10 @@ Field meanings:
 
 Current values:
 
-- `RUN=COMPLETE` means the run produced a usable behavior verdict. This covers
-  both green runs and ordinary red behavior failures.
+- `RUN=COMPLETE` means the run produced a usable completed verdict. This covers
+  both green runs and user-fixable red outcomes that still produced a
+  trustworthy result, including ordinary behavior failures and pure
+  `pytest-cov --cov-fail-under` gate failures.
 - `RUN=BROKEN` means the run failed in a recognized run-viability way, such as
   collection/import/setup/teardown/config problems where the primary next step
   is to make the run runnable first.
@@ -122,7 +124,9 @@ Current values:
   `Ctrl-C` or `pytest.exit(...)`.
 
 - `VERDICT=PASS` means the run produced a passing behavior verdict.
-- `VERDICT=FAIL` means a behavior failure was observed.
+- `VERDICT=FAIL` means the run completed red in a user-fixable way. This
+  includes behavior failures and run-complete policy gates such as unmet
+  `pytest-cov --cov-fail-under` thresholds.
 - `VERDICT=BROKEN` means no behavior verdict was produced because run viability
   was lost (collection / import / fixture / config).
 - `VERDICT=NONE` means no test verdict applies because zero tests were
@@ -142,8 +146,8 @@ Current values:
 - `ACTION=EXPAND` means a failure-replay subset (`--lf`, `--sw`,
   `--stepwise`) passed; re-invoke against the full suite to confirm nothing
   else regressed.
-- `ACTION=FIX` means a meaningful behavior-level failure occurred; fix the
-  failing behavior.
+- `ACTION=FIX` means a meaningful user-fixable red result occurred; fix the
+  failing behavior or unmet gate.
 - `ACTION=REPAIR` means the run did not yet provide a usable behavior verdict;
   restore runnability first (fix imports, syntax, fixtures, config).
 - `ACTION=ADJUST` means the selector or invocation needs editing (typo,
@@ -157,6 +161,10 @@ Mixed-case policy:
 - If at least one meaningful call-phase behavior failure occurred, the final
   line prefers `RUN=COMPLETE VERDICT=FAIL ACTION=FIX` even if teardown also
   failed.
+- Pure run-complete policy gates can also land in
+  `RUN=COMPLETE VERDICT=FAIL ACTION=FIX` without trim-native issue lines.
+  Current `pytest-cov --cov-fail-under` failures work this way; the replayed
+  coverage summary explains the red result.
 - `RUN=BROKEN VERDICT=BROKEN ACTION=REPAIR` is reserved for runs whose red
   result is primarily about run viability rather than behavior.
 
@@ -279,8 +287,8 @@ If you want a caller or agent to drive pytest automatically:
      pytest --trim --sw --ff --nf
      ```
 
-   - `ACTION=FIX`: fix the reported behavior failure(s), then rerun the same
-     pytest command.
+   - `ACTION=FIX`: fix the reported failure(s) or unmet gate(s), then rerun
+     the same pytest command.
    - `ACTION=REPAIR`: repair the broken run state first, then rerun the
      same pytest command.
    - `ACTION=ADJUST`: change the selection or invocation before rerunning.
