@@ -58,8 +58,34 @@ class FinalOutcome:
         return render_final_line(self.run, self.verdict, self.scope, self.action)
 
 
+@dataclass(frozen=True)
+class TrimCounts:
+    selected: int = 0
+    executed: int = 0
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
+    collection_errors: int = 0
+    skipped: int = 0
+    xfailed: int = 0
+    xpassed: int = 0
+    deselected: int = 0
+
+    def render(self) -> str:
+        return render_counts_line(self)
+
+
 def render_final_line(run: str, verdict: str, scope: str, action: str) -> str:
-    return f"{TRIM_PREFIX}RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+    return f"{TRIM_PREFIX}result RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+
+
+def render_counts_line(counts: TrimCounts) -> str:
+    return (
+        f"{TRIM_PREFIX}counts selected={counts.selected} executed={counts.executed} "
+        f"passed={counts.passed} failed={counts.failed} errors={counts.errors} "
+        f"collection_errors={counts.collection_errors} skipped={counts.skipped} "
+        f"xfailed={counts.xfailed} xpassed={counts.xpassed} deselected={counts.deselected}"
+    )
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -75,7 +101,9 @@ def pytest_configure(config: pytest.Config) -> None:
         return
 
     terminal_reporter = config.pluginmanager.getplugin("terminalreporter")
-    if os.environ.get("PYTEST_XDIST_WORKER") and terminal_reporter is None:
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        if config.pluginmanager.getplugin("trimworkerreporter") is None:
+            config.pluginmanager.register(TrimWorkerReporter(config), "trimworkerreporter")
         return
 
     if terminal_reporter is not None:
@@ -128,8 +156,49 @@ class TrimTerminalWriter:
         sys.stdout.flush()
 
 
+class TrackingStdout:
+    """Stdout proxy used only to decide whether the footer needs separation."""
+
+    _pytest_trim_stdout_tracker = True
+
+    def __init__(self, wrapped: object) -> None:
+        self._wrapped = wrapped
+        self.wrote_content = False
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._wrapped, name)
+
+    def write(self, content: str) -> object:
+        if content.strip():
+            self.wrote_content = True
+        return self._wrapped.write(content)
+
+    def flush(self) -> object:
+        return self._wrapped.flush()
+
+
+class TrimWorkerReporter:
+    """Worker-side xdist collector for state the coordinator cannot observe."""
+
+    def __init__(self, config: pytest.Config) -> None:
+        self.config = config
+        self._deselected_nodeids: set[str] = set()
+
+    def pytest_deselected(self, items: list[pytest.Item]) -> None:
+        self._deselected_nodeids.update(item.nodeid for item in items)
+
+    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
+        del session, exitstatus
+
+        workeroutput = getattr(self.config, "workeroutput", None)
+        if not isinstance(workeroutput, dict):
+            return
+
+        workeroutput["trim_deselected_nodeids"] = sorted(self._deselected_nodeids)
+
+
 class TrimReporter:
-    """Replacement terminal reporter with compact failure blocks and a final protocol line."""
+    """Replacement terminal reporter with compact failure blocks and protocol footer rows."""
 
     def __init__(self, config: pytest.Config) -> None:
         self.config = config
@@ -148,8 +217,15 @@ class TrimReporter:
         self._internal_error = False
         self._issues_emitted = False
         self._final_line_emitted = False
+        self._wrote_output_before_footer = False
+        self._selected_count: int | None = None
+        self._xdist_collected_nodeids: set[str] = set()
+        self._xdist_deselected_nodeids: set[str] = set()
+        self._item_outcomes: dict[str, str] = {}
+        self._stdout_tracker, self._stdout_tracker_installed = self._install_stdout_tracker()
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        self._record_item_outcome(report)
         if report.failed:
             self.stats.setdefault("failed", []).append(report)
             self._issues.append(report)
@@ -417,8 +493,33 @@ class TrimReporter:
     def _is_label_line(self, line: str) -> bool:
         return line.endswith(":") and not line.startswith(("- ", "+ ", "? "))
 
+    @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, items: list[pytest.Item]) -> None:
-        del items
+        self._selected_count = len(items)
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        self._selected_count = len(getattr(session, "items", []))
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_xdist_node_collection_finished(self, node: object, ids: list[str]) -> None:
+        del node
+        self._xdist_collected_nodeids.update(ids)
+        self._selected_count = len(self._xdist_collected_nodeids)
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node: object, error: object | None) -> None:
+        del error
+
+        workeroutput = getattr(node, "workeroutput", None)
+        if not isinstance(workeroutput, dict):
+            return
+
+        deselected_nodeids = workeroutput.get("trim_deselected_nodeids", [])
+        if isinstance(deselected_nodeids, list):
+            self._xdist_deselected_nodeids.update(
+                nodeid for nodeid in deselected_nodeids if isinstance(nodeid, str)
+            )
 
     def pytest_deselected(self, items: list[pytest.Item]) -> None:
         self.stats.setdefault("deselected", []).extend(items)
@@ -451,14 +552,18 @@ class TrimReporter:
     @pytest.hookimpl(trylast=True)
     def pytest_unconfigure(self, config: pytest.Config) -> None:
         if self._final_line_emitted:
+            self._restore_stdout_tracker()
             return
 
-        self._emit_issues()
-        if self._protocol_line_suppressed(config):
-            return
+        try:
+            self._emit_issues()
+            if self._protocol_line_suppressed(config):
+                return
 
-        self._emit_compatible_terminal_summaries()
-        self._emit_final_line(self._final_outcome().render())
+            self._emit_compatible_terminal_summaries()
+            self._emit_footer(self._counts(), self._final_outcome())
+        finally:
+            self._restore_stdout_tracker()
 
     def pytest_terminal_summary(
         self,
@@ -506,17 +611,32 @@ class TrimReporter:
         self._tw.line(line)
         self._final_line_emitted = True
 
+    def _emit_footer(self, counts: TrimCounts, outcome: FinalOutcome) -> None:
+        if self._final_line_emitted:
+            return
+
+        if self._footer_needs_leading_blank():
+            self._tw.line()
+
+        self._tw.line(counts.render())
+        self._emit_final_line(outcome.render())
+
     def _emit_issues(self) -> None:
         if self._issues_emitted:
             return
 
+        wrote_output = False
         for line in self._diagnostics:
             self._tw.line(line)
+            wrote_output = True
 
         for report in self._issues:
             for line in self._format_issue_lines(report):
                 self._tw.line(line)
+                wrote_output = True
 
+        if wrote_output:
+            self._wrote_output_before_footer = True
         self._issues_emitted = True
 
     def _emit_compatible_terminal_summaries(self) -> None:
@@ -550,8 +670,10 @@ class TrimReporter:
             if had_heading_flag:
                 cov_plugin._wrote_heading = False
             summary(terminal_reporter)
+            self._wrote_output_before_footer = True
         except Exception as exc:  # pragma: no cover - compatibility replay must not break trim runs
             self._tw.line(f"COVERAGE SUMMARY REPLAY FAILED: {exc}")
+            self._wrote_output_before_footer = True
         finally:
             if had_heading_flag:
                 cov_plugin._wrote_heading = previous_heading_flag
@@ -656,3 +778,118 @@ class TrimReporter:
             return "unknown internal error"
 
         return fallback.splitlines()[-1]
+
+    def _install_stdout_tracker(self) -> tuple[TrackingStdout | None, bool]:
+        stdout = sys.stdout
+        if getattr(stdout, "_pytest_trim_stdout_tracker", False):
+            return stdout, False
+
+        tracker = TrackingStdout(stdout)
+        sys.stdout = tracker
+        return tracker, True
+
+    def _restore_stdout_tracker(self) -> None:
+        if self._stdout_tracker is None or not self._stdout_tracker_installed:
+            return
+
+        if sys.stdout is self._stdout_tracker:
+            sys.stdout = self._stdout_tracker._wrapped
+
+    def _footer_needs_leading_blank(self) -> bool:
+        if self._wrote_output_before_footer:
+            return True
+
+        if self._stdout_tracker is not None and self._stdout_tracker.wrote_content:
+            return True
+
+        getvalue = getattr(sys.stdout, "getvalue", None)
+        if callable(getvalue):
+            try:
+                return bool(str(getvalue()).strip())
+            except Exception:  # pragma: no cover - best-effort capture introspection
+                return False
+
+        return False
+
+    def _record_item_outcome(self, report: pytest.TestReport) -> None:
+        bucket = self._outcome_bucket(report)
+        if bucket is None:
+            return
+
+        current = self._item_outcomes.get(report.nodeid)
+        if current is None or self._outcome_rank(bucket) > self._outcome_rank(current):
+            self._item_outcomes[report.nodeid] = bucket
+
+    def _outcome_bucket(self, report: pytest.TestReport) -> str | None:
+        if report.failed:
+            return "failed" if report.when == "call" else "errors"
+
+        if report.skipped:
+            return "xfailed" if hasattr(report, "wasxfail") else "skipped"
+
+        if report.when != "call":
+            return None
+
+        if report.passed:
+            return "xpassed" if hasattr(report, "wasxfail") else "passed"
+
+        return None
+
+    def _outcome_rank(self, bucket: str) -> int:
+        return {
+            "passed": 1,
+            "skipped": 2,
+            "xfailed": 3,
+            "xpassed": 4,
+            "failed": 5,
+            "errors": 6,
+        }[bucket]
+
+    def _counts(self) -> TrimCounts:
+        collection_errors = len(self.stats.get("error", []))
+        bucket_counts = {
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        }
+        if not collection_errors:
+            for bucket in self._item_outcomes.values():
+                bucket_counts[bucket] += 1
+
+        executed = sum(bucket_counts.values())
+        return TrimCounts(
+            selected=self._resolved_selected_count(),
+            executed=executed,
+            passed=bucket_counts["passed"],
+            failed=bucket_counts["failed"],
+            errors=bucket_counts["errors"],
+            collection_errors=collection_errors,
+            skipped=bucket_counts["skipped"],
+            xfailed=bucket_counts["xfailed"],
+            xpassed=bucket_counts["xpassed"],
+            deselected=self._resolved_deselected_count(),
+        )
+
+    def _resolved_selected_count(self) -> int:
+        if self.stats.get("error"):
+            return 0
+
+        if self._selected_count is not None:
+            return self._selected_count
+
+        if self._xdist_collected_nodeids:
+            return len(self._xdist_collected_nodeids)
+
+        if self._item_outcomes:
+            return len(self._item_outcomes)
+
+        return 0
+
+    def _resolved_deselected_count(self) -> int:
+        if self._xdist_deselected_nodeids:
+            return len(self._xdist_deselected_nodeids)
+
+        return len(self.stats.get("deselected", []))

@@ -18,6 +18,8 @@ from tests.support import INTERRUPTED_FULL_LINE
 from tests.support import PLUGIN_NAME
 from tests.support import REPAIR_FULL_LINE
 from tests.support import TRIM_PREFIX
+from tests.support import counts_line
+from tests.support import non_empty_lines
 from tests.support import output_lines
 from tests.support import run_trim_pytest
 
@@ -45,6 +47,118 @@ def test_all_passes_emit_standard_pass_message(
 
     assert result.ret == pytest.ExitCode.OK
     assert output_lines(result) == [DONE_FULL_LINE]
+
+
+def test_pass_only_run_emits_counts_before_final_result_without_leading_blank(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_ok=(
+            "def test_one():\n"
+            "    assert True\n\n"
+            "def test_two():\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    assert result.stdout.str().splitlines() == [
+        counts_line(selected=2, executed=2, passed=2),
+        DONE_FULL_LINE,
+    ]
+
+
+def test_mixed_outcome_counts_use_item_buckets_in_protocol_order(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_mixed=(
+            "import pytest\n\n"
+            "def test_pass():\n"
+            "    assert True\n\n"
+            "def test_fail():\n"
+            "    assert False\n\n"
+            "def test_skip():\n"
+            "    pytest.skip('skip')\n\n"
+            "@pytest.mark.xfail(reason='expected')\n"
+            "def test_xfail():\n"
+            "    assert False\n\n"
+            "@pytest.mark.xfail(reason='unexpected')\n"
+            "def test_xpass():\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert re.fullmatch(r"test_mixed\.py::test_fail:\d+ - assert False", lines[0])
+    assert lines[-2] == counts_line(
+        selected=5,
+        executed=5,
+        passed=1,
+        failed=1,
+        skipped=1,
+        xfailed=1,
+        xpassed=1,
+    )
+    assert lines[-1] == FIX_FULL_LINE
+
+
+def test_footer_block_is_separated_from_issue_output_and_result_stays_last(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_fail=(
+            "def test_boom():\n"
+            "    assert 1 == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = result.stdout.str().splitlines()
+    assert re.fullmatch(r"test_fail\.py::test_boom:\d+ - assert 1 == 2", lines[0])
+    assert lines[-3:] == [
+        "",
+        counts_line(selected=1, executed=1, failed=1),
+        FIX_FULL_LINE,
+    ]
+
+
+def test_direct_stdout_is_separated_from_footer_block(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_ok=(
+            "def test_one():\n"
+            "    print('TEST-OUTPUT')\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "-s")
+
+    assert result.stdout.str().splitlines() == [
+        "TEST-OUTPUT",
+        "",
+        counts_line(selected=1, executed=1, passed=1),
+        DONE_FULL_LINE,
+    ]
 
 
 def test_single_test_failure_emits_one_line(
@@ -316,6 +430,32 @@ def test_call_and_teardown_failures_emit_one_issue_block_each(
     assert lines[2] == FIX_FULL_LINE
 
 
+def test_multi_phase_single_item_counts_most_severe_observed_outcome(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_multi=(
+            "import pytest\n\n"
+            "@pytest.fixture\n"
+            "def broken_teardown():\n"
+            "    yield\n"
+            "    raise RuntimeError('boom in teardown')\n\n"
+            "def test_both_failures(broken_teardown):\n"
+            "    assert 1 == 2\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert lines[-2] == counts_line(selected=1, executed=1, errors=1)
+    assert lines[-1] == FIX_FULL_LINE
+
+
 def test_collection_syntax_error_is_reported_with_line_number(
     pytester: pytest.Pytester,
     local_plugin_importable: Path,
@@ -338,6 +478,54 @@ def test_collection_syntax_error_is_reported_with_line_number(
     assert len(lines) == 2
     assert re.fullmatch(r"test_syntax\.py:\d+ - .*SyntaxError.*", lines[0])
     assert lines[1] == REPAIR_FULL_LINE
+
+
+def test_collection_error_counts_stay_separate_from_selected_and_errors(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_syntax=(
+            "def test_ok():\n"
+            "    assert True\n\n"
+            "def broken_syntax(\n"
+            "    pass\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.INTERRUPTED
+    assert lines[-2] == counts_line(collection_errors=1)
+    assert lines[-1] == REPAIR_FULL_LINE
+
+
+def test_collection_error_suppresses_item_buckets_when_collection_continues(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_ok=(
+            "def test_one():\n"
+            "    assert True\n"
+        ),
+        test_syntax=(
+            "def broken_syntax(\n"
+            "    pass\n"
+        ),
+    )
+
+    result = run_trim_pytest(pytester, "--continue-on-collection-errors")
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert lines[-2] == counts_line(collection_errors=1)
+    assert lines[-1] == REPAIR_FULL_LINE
 
 
 def test_collection_import_error_is_reported(
@@ -475,6 +663,29 @@ def test_strict_xpass_is_reported_as_failure(
     assert lines[1] == FIX_FULL_LINE
 
 
+def test_strict_xpass_counts_as_failed_item(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_strict_xpass=(
+            "import pytest\n\n"
+            "@pytest.mark.xfail(reason='strict pass', strict=True)\n"
+            "def test_xpass():\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert lines[-2] == counts_line(selected=1, executed=1, failed=1)
+    assert lines[-1] == FIX_FULL_LINE
+
+
 def test_internal_error_emits_diagnostic_block_without_traceback_noise(
     pytester: pytest.Pytester,
     local_plugin_importable: Path,
@@ -497,6 +708,26 @@ def test_internal_error_emits_diagnostic_block_without_traceback_noise(
     assert "INTERNALERROR>" not in stdout
 
 
+def test_internal_error_after_trim_initialization_emits_zero_counts_row(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makeconftest(
+        "def pytest_sessionstart(session):\n"
+        "    raise RuntimeError('boom')\n"
+    )
+
+    result = run_trim_pytest(pytester)
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.INTERNAL_ERROR
+    assert lines[0].startswith("INTERNAL ERROR: ")
+    assert lines[-2] == counts_line()
+    assert lines[-1] == ERROR_FULL_LINE
+
+
 def test_abnormal_exit_emits_interrupted_status(
     pytester: pytest.Pytester,
     local_plugin_importable: Path,
@@ -514,7 +745,10 @@ def test_abnormal_exit_emits_interrupted_status(
     result = run_trim_pytest(pytester)
 
     assert result.ret == pytest.ExitCode.INTERRUPTED
-    assert output_lines(result) == [INTERRUPTED_FULL_LINE]
+    assert non_empty_lines(result.stdout.str()) == [
+        counts_line(selected=1),
+        INTERRUPTED_FULL_LINE,
+    ]
 
 
 def test_usage_error_does_not_claim_final_status_token(
@@ -533,6 +767,28 @@ def test_usage_error_does_not_claim_final_status_token(
 
     assert not any(line.startswith(TRIM_PREFIX) for line in stdout.splitlines())
     assert not any(line.startswith(TRIM_PREFIX) for line in stderr.splitlines())
+
+
+def test_post_initialization_usage_error_emits_footer_rows(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makeconftest(
+        "import pytest\n\n"
+        "def pytest_sessionstart(session):\n"
+        "    raise pytest.UsageError('late bad usage')\n"
+    )
+
+    result = run_trim_pytest(pytester)
+
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    assert non_empty_lines(result.stdout.str()) == [
+        counts_line(),
+        ERROR_FULL_LINE,
+    ]
+    assert "late bad usage" in result.stderr.str()
 
 
 def test_collect_only_suppresses_protocol_line(

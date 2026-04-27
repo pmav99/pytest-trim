@@ -14,8 +14,10 @@ from tests.support import DONE_PARTIAL_LINE
 from tests.support import FIX_FULL_LINE
 from tests.support import FIX_PARTIAL_LINE
 from tests.support import PLUGIN_NAME
+from tests.support import REPAIR_FULL_LINE
 from tests.support import TRIM_PREFIX
 from tests.support import artifact_path_from_lines
+from tests.support import counts_line
 from tests.support import isolated_pytest_root
 from tests.support import non_empty_lines
 from tests.support import output_lines
@@ -236,7 +238,101 @@ def test_xdist_run_keeps_final_status_token(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0
-    assert non_empty_lines(result.stdout) == [DONE_PARTIAL_LINE]
+    assert non_empty_lines(result.stdout) == [
+        counts_line(selected=1, executed=1, passed=1),
+        DONE_PARTIAL_LINE,
+    ]
+    assert result.stderr == ""
+
+
+def test_xdist_counts_deselected_items_once_on_coordinator(tmp_path: Path) -> None:
+    pytest.importorskip("xdist")
+
+    package_root = Path(__file__).resolve().parents[1]
+    test_file = tmp_path / "test_selection.py"
+    test_file.write_text(
+        "def test_one():\n"
+        "    assert True\n\n"
+        "def test_two():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            PLUGIN_NAME,
+            "--trim",
+            "-n",
+            "2",
+            "-k",
+            "one",
+            str(test_file),
+        ],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(package_root / "src"),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert non_empty_lines(result.stdout) == [
+        counts_line(selected=1, executed=1, passed=1, deselected=1),
+        DONE_PARTIAL_LINE,
+    ]
+    assert result.stderr == ""
+
+
+def test_xdist_collection_error_keeps_selected_zero_when_other_files_collect(tmp_path: Path) -> None:
+    pytest.importorskip("xdist")
+
+    package_root = Path(__file__).resolve().parents[1]
+    (tmp_path / "test_ok.py").write_text(
+        "def test_one():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_syntax.py").write_text(
+        "def test_bad(\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "xdist.plugin",
+            "-p",
+            PLUGIN_NAME,
+            "--trim",
+            "-n",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        env=subprocess_env(package_root / "src"),
+        cwd=tmp_path,
+        check=False,
+    )
+
+    lines = non_empty_lines(result.stdout)
+    assert result.returncode != 0
+    assert lines[0].startswith("test_syntax.py")
+    assert lines[-2:] == [
+        counts_line(collection_errors=1),
+        REPAIR_FULL_LINE,
+    ]
     assert result.stderr == ""
 
 
@@ -275,9 +371,12 @@ def test_xdist_failure_keeps_trimmed_headline_before_final_status_token(tmp_path
 
     lines = non_empty_lines(result.stdout)
     assert result.returncode == pytest.ExitCode.TESTS_FAILED
-    assert len(lines) == 2
+    assert len(lines) == 3
     assert re.fullmatch(r"test_fail\.py::test_one:\d+ - assert 1 == 2", lines[0])
-    assert lines[1] == FIX_PARTIAL_LINE
+    assert lines[-2:] == [
+        counts_line(selected=1, executed=1, failed=1),
+        FIX_PARTIAL_LINE,
+    ]
     assert result.stderr == ""
 
 
@@ -320,12 +419,13 @@ def test_xdist_failure_can_write_artifact_file(tmp_path: Path) -> None:
     artifact_path = artifact_path_from_lines(lines, tmp_path)
 
     assert result.returncode == pytest.ExitCode.TESTS_FAILED
-    assert len(lines) == 3
+    assert len(lines) == 4
     assert re.fullmatch(r"test_fail\.py::test_one:\d+ - assert 1 == 2", lines[0])
     assert lines[1].startswith("  artifact: ")
     assert artifact_path.exists()
     assert "test_fail.py::test_one" in artifact_path.read_text(encoding="utf-8")
-    assert lines[2] == FIX_PARTIAL_LINE
+    assert lines[2] == counts_line(selected=1, executed=1, failed=1)
+    assert lines[3] == FIX_PARTIAL_LINE
     assert result.stderr == ""
 
 
@@ -411,7 +511,7 @@ def test_pytest_cov_fail_under_changes_final_status_token(
     assert "previously imported, but not measured" not in stderr
 
 
-def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
+def test_xdist_worker_registers_only_worker_reporter_without_terminal_reporter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registered: list[tuple[object, str]] = []
@@ -445,7 +545,8 @@ def test_plugin_is_disabled_on_xdist_worker_without_terminal_reporter(
 
     pytest_configure(DummyConfig())
 
-    assert registered == []
+    assert len(registered) == 1
+    assert registered[0][1] == "trimworkerreporter"
     assert reporter_created == []
     assert wrapped_writers == []
 
@@ -499,5 +600,8 @@ def test_pytest11_autodiscovery_works_from_installed_dist_info(tmp_path: Path) -
     )
 
     assert installed_result.returncode == 0
-    assert non_empty_lines(installed_result.stdout) == [DONE_PARTIAL_LINE]
+    assert non_empty_lines(installed_result.stdout) == [
+        counts_line(selected=1, executed=1, passed=1),
+        DONE_PARTIAL_LINE,
+    ]
     assert installed_result.stderr == ""

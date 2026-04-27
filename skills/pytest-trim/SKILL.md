@@ -75,10 +75,19 @@ The plugin only changes output when `--trim` is present.
 
 ## Output Contract
 
-Treat the final non-empty line as the protocol line. Any earlier non-empty
-lines are issue reports. The protocol line always begins with the literal
-`TRIM: ` prefix, so parsers should anchor on that prefix to locate it in mixed
-output.
+For the authoritative footer protocol contract, see
+`docs/specs/trim-protocol-v1.md`.
+
+Parse all non-empty lines that begin with the literal `TRIM: ` prefix. The
+first token after the prefix is the row type:
+
+- `counts` gives item-oriented run-scale context.
+- `result` gives the final run classification and is always the final
+  non-empty stdout line.
+
+Do not treat every earlier non-empty line as an issue report. Earlier output
+can include `TRIM: counts ...`, diagnostics, direct stdout, or replayed plugin
+summary text.
 
 Issue lines are emitted in one of these forms:
 
@@ -100,16 +109,23 @@ If artifact mode is enabled, an issue may also include:
 This points to a per-failure text artifact containing pytest's full
 `longreprtext` and any captured sections available on the report.
 
-The final line always has this shape:
+The footer block has this shape:
 
-`TRIM: RUN=... VERDICT=... SCOPE=... ACTION=...`
+`TRIM: counts selected=... executed=... passed=... failed=... errors=... collection_errors=... skipped=... xfailed=... xpassed=... deselected=...`
 
-This is protocol v1. v1 evolves additive-only: new enum values may appear for
-existing keys. Any breaking change will use a new prefix such as `TRIM2:`, so
-a v1 parser that anchors on `TRIM: ` will simply fail to find its prefix.
+`TRIM: result RUN=... VERDICT=... SCOPE=... ACTION=...`
+
+This is protocol v1. v1 evolves additive-only: new result enum values may
+appear for existing keys. Any breaking change will use a new prefix such as
+`TRIM2:`, so a v1 parser that anchors on `TRIM: ` will simply fail to find its
+prefix.
 
 Field meanings:
 
+- `counts` values are non-negative integers. `executed` equals
+  `passed + failed + errors + skipped + xfailed + xpassed`.
+- `selected` is post-deselection intended item count. `deselected` and
+  `collection_errors` are separate and do not contribute to `executed`.
 - `RUN` is the coarse outcome category.
 - `VERDICT` is a direct red/green/broken signal. Route on `VERDICT` alone for
   triage.
@@ -148,7 +164,7 @@ Field meanings:
 ### Current `ACTION` Values
 
 - `DONE`: successful run; no follow-up needed.
-- `EXPAND`: a failure-replay subset (`--lf`, `--ff`, `--sw`, `--stepwise`)
+- `EXPAND`: a failure-replay subset (`--lf`, `--sw`, `--stepwise`)
   passed; re-invoke against the full suite to confirm nothing else regressed.
 - `FIX`: a meaningful user-fixable red result occurred; fix the behavior or
   unmet gate.
@@ -160,13 +176,16 @@ Field meanings:
 
 ## Operating Guidance
 
-- Parse the last non-empty line first; anchor on the `TRIM: ` prefix.
+- Parse the last non-empty line first; it must be `TRIM: result ...`.
+- Parse the adjacent `TRIM: counts ...` row for scale context before choosing
+  between inspecting one failure, broadening selection, or repairing shared
+  run state.
 - If `ACTION=FIX` and issue lines are present, use them as the actionable
   failures. This includes both broken product behavior and broken test
   behavior, such as stale assertions, wrong expected values, or buggy test
   helpers.
 - If `ACTION=FIX` and no issue lines are present, inspect replayed plugin
-  summary text before the final line. Pure `pytest-cov --cov-fail-under`
+  summary text before the footer block. Pure `pytest-cov --cov-fail-under`
   failures currently work this way.
 - If `ACTION=REPAIR`, repair the run first, then rerun the same pytest
   command.
@@ -208,7 +227,7 @@ Use this recipe to avoid declaring a fix complete based on a narrowed rerun.
 1. **Save the original command.** Record the full-suite invocation the user
    asked for, such as `poetry run pytest --trim --trim-artifacts`. This is the
    verification target.
-2. **Run it.** Parse the final `TRIM: ...` line.
+2. **Run it.** Parse the final `TRIM: result ...` row.
    - `ACTION=DONE` with `SCOPE=FULL` -> stop, green.
    - `ACTION=FIX` -> proceed to step 3.
    - `ACTION=REPAIR` -> fix runnability (imports/fixtures/config), rerun the

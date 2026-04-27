@@ -14,6 +14,7 @@ from tests.support import EXPAND_PARTIAL_LINE
 from tests.support import FIX_FULL_LINE
 from tests.support import FIX_PARTIAL_LINE
 from tests.support import PLUGIN_NAME
+from tests.support import counts_line
 from tests.support import non_empty_lines
 from tests.support import output_lines
 from tests.support import run_trim_pytest
@@ -60,6 +61,28 @@ def test_no_tests_collected_emits_no_tests_status(
     assert output_lines(result) == [EMPTY_LINE]
 
 
+def test_no_tests_collected_counts_deselection_without_selected_items(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_example=(
+            "def test_ok():\n"
+            "    assert True\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "-k", "does_not_match_anything")
+
+    assert result.ret == pytest.ExitCode.NO_TESTS_COLLECTED
+    assert non_empty_lines(result.stdout.str()) == [
+        counts_line(deselected=1),
+        EMPTY_LINE,
+    ]
+
+
 def test_no_tests_subprocess_keeps_pytest_exit_code(tmp_path: Path) -> None:
     package_root = Path(__file__).resolve().parents[1]
     test_file = tmp_path / "test_ok.py"
@@ -90,7 +113,10 @@ def test_no_tests_subprocess_keeps_pytest_exit_code(tmp_path: Path) -> None:
     )
 
     assert result.returncode == pytest.ExitCode.NO_TESTS_COLLECTED
-    assert non_empty_lines(result.stdout) == [EMPTY_LINE]
+    assert non_empty_lines(result.stdout) == [
+        counts_line(deselected=1),
+        EMPTY_LINE,
+    ]
 
 
 def test_last_failed_clean_rerun_requests_one_full_follow_up(
@@ -244,6 +270,29 @@ def test_maxfail_reports_only_seen_failures(
     assert len(lines) == 2
     assert re.fullmatch(r"test_maxfail\.py::test_first:\d+ - assert False", lines[0])
     assert lines[1] == FIX_FULL_LINE
+
+
+def test_maxfail_counts_unexecuted_selected_items_by_difference(
+    pytester: pytest.Pytester,
+    local_plugin_importable: Path,
+) -> None:
+    del local_plugin_importable
+
+    pytester.makepyfile(
+        test_maxfail=(
+            "def test_first():\n"
+            "    assert False\n\n"
+            "def test_second():\n"
+            "    assert False\n"
+        )
+    )
+
+    result = run_trim_pytest(pytester, "--maxfail=1")
+
+    lines = non_empty_lines(result.stdout.str())
+    assert result.ret == pytest.ExitCode.TESTS_FAILED
+    assert lines[-2] == counts_line(selected=2, executed=1, failed=1)
+    assert lines[-1] == FIX_FULL_LINE
 
 
 def test_stepwise_failure_emits_fix_partial_status(

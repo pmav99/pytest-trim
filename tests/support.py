@@ -28,6 +28,8 @@ from pytest_trim.plugin import VERDICT_FAIL
 from pytest_trim.plugin import VERDICT_NONE
 from pytest_trim.plugin import VERDICT_PASS
 from pytest_trim.plugin import VERDICT_UNKNOWN
+from pytest_trim.plugin import TrimCounts
+from pytest_trim.plugin import render_counts_line
 
 
 PLUGIN_NAME = "pytest_trim_bootstrap"
@@ -51,7 +53,7 @@ def non_empty_lines(text: str) -> list[str]:
 
 
 def output_lines(result: pytest.RunResult) -> list[str]:
-    return non_empty_lines(result.stdout.str())
+    return [line for line in non_empty_lines(result.stdout.str()) if not line.startswith(f"{TRIM_PREFIX}counts ")]
 
 
 def artifact_path_from_lines(lines: list[str], root: Path) -> Path:
@@ -67,7 +69,36 @@ def artifact_path_from_lines(lines: list[str], root: Path) -> Path:
 
 
 def final_line(run: str, verdict: str, scope: str, action: str) -> str:
-    return f"{TRIM_PREFIX}RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+    return f"{TRIM_PREFIX}result RUN={run} VERDICT={verdict} SCOPE={scope} ACTION={action}"
+
+
+def counts_line(
+    *,
+    selected: int = 0,
+    executed: int = 0,
+    passed: int = 0,
+    failed: int = 0,
+    errors: int = 0,
+    collection_errors: int = 0,
+    skipped: int = 0,
+    xfailed: int = 0,
+    xpassed: int = 0,
+    deselected: int = 0,
+) -> str:
+    return render_counts_line(
+        TrimCounts(
+            selected=selected,
+            executed=executed,
+            passed=passed,
+            failed=failed,
+            errors=errors,
+            collection_errors=collection_errors,
+            skipped=skipped,
+            xfailed=xfailed,
+            xpassed=xpassed,
+            deselected=deselected,
+        )
+    )
 
 
 DONE_FULL_LINE = final_line(RUN_COMPLETE, VERDICT_PASS, SCOPE_FULL, ACTION_DONE)

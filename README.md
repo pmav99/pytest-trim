@@ -3,7 +3,7 @@
 `pytest-trim` is a pytest plugin that emits compact, machine-friendly test
 output to minimize transcript size and context load. With `--trim`, it
 suppresses normal pytest terminal noise, prints one compact block per issue,
-and normally finishes with a single machine-readable protocol line.
+and normally finishes with a two-row machine-readable footer.
 
 ## Quick Introduction
 
@@ -20,7 +20,7 @@ For a Python developer, the practical idea is simple:
 - keep normal pytest semantics and exit codes
 - hide most progress noise, headers, and long summaries
 - print one compact block per relevant failure
-- end with a stable final line that says what happened and what to do next
+- end with typed `TRIM:` rows that report counts and the final result
 
 That makes it useful for fast local loops, wrapper scripts, CI adapters, and
 agent-style workflows where the caller needs a compact answer rather than the
@@ -28,19 +28,22 @@ full pytest transcript.
 
 If a skill-aware LLM or coding agent is working in this repository, see
 [`skills/pytest-trim/SKILL.md`](skills/pytest-trim/SKILL.md) for repo-local
-guidance on running `pytest-trim` and interpreting the final protocol line.
+guidance on running `pytest-trim` and interpreting the footer rows.
 
 A normal passing run looks like this:
 
 ```text
-TRIM: RUN=COMPLETE VERDICT=PASS SCOPE=FULL ACTION=DONE
+TRIM: counts selected=2 executed=2 passed=2 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=PASS SCOPE=FULL ACTION=DONE
 ```
 
 A failing run stays really concise:
 
 ```text
 tests/test_example.py::test_breaks:12 - assert 1 == 2
-TRIM: RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
+
+TRIM: counts selected=1 executed=1 passed=0 failed=1 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
 ```
 
 - Use regular pytest when you want the full debugging surface.
@@ -77,8 +80,8 @@ pytest --trim --sw --ff --nf
 
 ## Output Contract
 
-With `--trim`, the plugin emits machine-friendly failure summaries once pytest has
-successfully initialized the test run:
+With `--trim`, the plugin emits machine-friendly failure summaries once pytest
+has successfully initialized the test run:
 
 - Each failure starts with a headline line in the form `nodeid:lineno - message`
   when line numbers are available, otherwise `nodeid - message`.
@@ -90,83 +93,26 @@ successfully initialized the test run:
   cache directory (or a user-specified directory).
 - Verbosity flags such as `-v`, `-vv`, `-vvv`, and `--verbose` do not change
   the compact `--trim` output.
-- After pytest finishes its summary hooks, the final emitted line has this
+- After pytest finishes its summary hooks, the final emitted footer has this
   shape:
-  `TRIM: RUN=... VERDICT=... SCOPE=... ACTION=...`
+  `TRIM: counts selected=... executed=... passed=... failed=... errors=... collection_errors=... skipped=... xfailed=... xpassed=... deselected=...`
+  followed by
+  `TRIM: result RUN=... VERDICT=... SCOPE=... ACTION=...`
 
-The `TRIM: ` prefix anchors parsers against mixed pytest output. All four keys
-are always present, always uppercase, and always emitted in that order. This
-is protocol v1; it evolves additive-only within v1 (new enum values may be
-introduced), and any breaking change will use a new prefix (e.g. `TRIM2:`).
+The final `TRIM: result ...` row is the authoritative machine-readable result
+for the run and remains the final non-empty stdout line.
 
-Field meanings:
+In short:
 
+- `counts` gives item-oriented run-scale context.
 - `RUN` is the coarse machine-readable run-state category.
-- `VERDICT` is the direct red/green/broken behavior signal. Agents can route
-  on `VERDICT` alone for triage.
-- `SCOPE` is the intended or resolved run scope after selection resolution. It
-  is not a measure of achieved verification completeness.
-- `ACTION` is the agent-facing next-step signal. Each value maps 1:1 to one
-  operation, so an agent can route entirely on `ACTION`.
+- `VERDICT` is the direct red/green/broken behavior signal.
+- `SCOPE` is the intended or resolved run scope after selection resolution.
+- `ACTION` is the agent-facing next-step signal.
 
-Current values:
-
-- `RUN=COMPLETE` means the run produced a usable completed verdict. This covers
-  both green runs and user-fixable red outcomes that still produced a
-  trustworthy result, including ordinary behavior failures and pure
-  `pytest-cov --cov-fail-under` gate failures.
-- `RUN=BROKEN` means the run failed in a recognized run-viability way, such as
-  collection/import/setup/teardown/config problems where the primary next step
-  is to make the run runnable first.
-- `RUN=EMPTY` means selection resolved to zero tests.
-- `RUN=ERROR` means pytest or a plugin crashed abnormally.
-- `RUN=INTERRUPTED` means the run was interrupted explicitly, such as
-  `Ctrl-C` or `pytest.exit(...)`.
-
-- `VERDICT=PASS` means the run produced a passing behavior verdict.
-- `VERDICT=FAIL` means the run completed red in a user-fixable way. This
-  includes behavior failures and run-complete policy gates such as unmet
-  `pytest-cov --cov-fail-under` thresholds.
-- `VERDICT=BROKEN` means no behavior verdict was produced because run viability
-  was lost (collection / import / fixture / config).
-- `VERDICT=NONE` means no test verdict applies because zero tests were
-  selected.
-- `VERDICT=UNKNOWN` means the run ended abnormally and no trustworthy verdict
-  can be derived.
-
-- `SCOPE=FULL` means the command was targeting the full suite after selection
-  resolution. Full-run `-x` and `--maxfail` still report `SCOPE=FULL`.
-- `SCOPE=PARTIAL` means the command intentionally targeted a narrowed or
-  mode-limited subset, such as explicit paths or nodeids, `-k`, `-m`,
-  `--lf` reruns of previous failures, resumed or currently-stopped `--sw`, and
-  other subset-selection plugins such as testmon when they narrow the run.
-- `SCOPE=NONE` means zero tests were selected to run.
-
-- `ACTION=DONE` means no follow-up pytest command is needed.
-- `ACTION=EXPAND` means a failure-replay subset (`--lf`, `--sw`,
-  `--stepwise`) passed; re-invoke against the full suite to confirm nothing
-  else regressed.
-- `ACTION=FIX` means a meaningful user-fixable red result occurred; fix the
-  failing behavior or unmet gate.
-- `ACTION=REPAIR` means the run did not yet provide a usable behavior verdict;
-  restore runnability first (fix imports, syntax, fixtures, config).
-- `ACTION=ADJUST` means the selector or invocation needs editing (typo,
-  over-narrow filter, wrong path).
-- `ACTION=INVESTIGATE` means the runner or tooling itself failed; escalate,
-  output may be unreliable.
-- `ACTION=ABORT` means the run was halted externally; do not auto-retry.
-
-Mixed-case policy:
-
-- If at least one meaningful call-phase behavior failure occurred, the final
-  line prefers `RUN=COMPLETE VERDICT=FAIL ACTION=FIX` even if teardown also
-  failed.
-- Pure run-complete policy gates can also land in
-  `RUN=COMPLETE VERDICT=FAIL ACTION=FIX` without trim-native issue lines.
-  Current `pytest-cov --cov-fail-under` failures work this way; the replayed
-  coverage summary explains the red result.
-- `RUN=BROKEN VERDICT=BROKEN ACTION=REPAIR` is reserved for runs whose red
-  result is primarily about run viability rather than behavior.
+For the full protocol contract, including exact allowed values, precedence
+rules, legal combinations, and design rationale, see
+[`docs/specs/trim-protocol-v1.md`](docs/specs/trim-protocol-v1.md).
 
 Notes:
 
@@ -177,22 +123,20 @@ Notes:
 - Output written through pytest's terminal reporter stays hidden by default,
   including terminal-summary hooks that call
   `terminalreporter.write_line(...)`.
-- `pytest-cov` terminal coverage sections are replayed before the final
-  protocol line, so `pytest --trim --cov=...` still shows the coverage report.
+- `pytest-cov` terminal coverage sections are replayed before the footer block,
+  so `pytest --trim --cov=...` still shows the coverage report.
 - Direct writes to stdout/stderr, such as `print(...)` in tests or hooks, may
-  still appear before the final protocol line.
+  still appear before the footer block.
 - Artifact files include pytest's `longreprtext` and captured sections when
   capture is enabled. Under `-s` / `--capture=no`, the artifact still contains
   the traceback, but uncaptured stdout/stderr cannot be reconstructed.
-- The final protocol line is the authoritative machine-readable result for the
-  run.
-- `pytest --trim --collect-only` suppresses the final protocol line because
+- `pytest --trim --collect-only` suppresses the footer block because
   collection is not a behavior run.
 - `--ff` reorders a full run; by itself it still reports `SCOPE=FULL` and, on
   pass, `ACTION=DONE`.
 - CLI usage errors and very-early startup/configuration failures can happen
   before the plugin takes over terminal reporting; in those cases pytest may
-  emit raw diagnostic output instead of a final protocol line.
+  emit raw diagnostic output instead of footer rows.
 
 ## Examples
 
@@ -200,7 +144,9 @@ Single failing run:
 
 ```text
 tests/test_example.py::test_breaks:12 - assert 1 == 2
-TRIM: RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
+
+TRIM: counts selected=1 executed=1 passed=0 failed=1 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
 ```
 
 Failing run with retained assertion detail:
@@ -208,7 +154,9 @@ Failing run with retained assertion detail:
 ```text
 tests/test_example.py::test_list_diff:12 - assert [1, 2, 3] == [1, 2, 3, 4]
   detail: Right contains one more item: 4
-TRIM: RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
+
+TRIM: counts selected=1 executed=1 passed=0 failed=1 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
 ```
 
 Verbose run with filtered rich assertion details:
@@ -218,51 +166,62 @@ tests/test_example.py::test_dict_diff:12 - assert {'a': 1, 'b': 2, 'c': 3} == {'
   detail: Differing items: {'b': 2} != {'b': 8}
   detail: Differing items: {'c': 3} != {'c': 7}
   detail: (+1 more details omitted)
-TRIM: RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
+
+TRIM: counts selected=1 executed=1 passed=0 failed=1 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=FAIL SCOPE=FULL ACTION=FIX
 ```
 
 Run with capture disabled:
 
 ```text
 some test output
-TRIM: RUN=COMPLETE VERDICT=PASS SCOPE=FULL ACTION=DONE
+
+TRIM: counts selected=1 executed=1 passed=1 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=PASS SCOPE=FULL ACTION=DONE
 ```
 
 Stepwise run that stopped at the current failing test:
 
 ```text
 tests/test_example.py::test_breaks:12 - assert False
-TRIM: RUN=COMPLETE VERDICT=FAIL SCOPE=PARTIAL ACTION=FIX
+
+TRIM: counts selected=2 executed=1 passed=0 failed=1 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=FAIL SCOPE=PARTIAL ACTION=FIX
 ```
 
 Stepwise run that reached the end:
 
 ```text
-TRIM: RUN=COMPLETE VERDICT=PASS SCOPE=PARTIAL ACTION=EXPAND
+TRIM: counts selected=1 executed=1 passed=1 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=PASS SCOPE=PARTIAL ACTION=EXPAND
 ```
 
 Clean pass:
 
 ```text
-TRIM: RUN=COMPLETE VERDICT=PASS SCOPE=FULL ACTION=DONE
+TRIM: counts selected=1 executed=1 passed=1 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=COMPLETE VERDICT=PASS SCOPE=FULL ACTION=DONE
 ```
 
 Selector matched nothing:
 
 ```text
-TRIM: RUN=EMPTY VERDICT=NONE SCOPE=NONE ACTION=ADJUST
+TRIM: counts selected=0 executed=0 passed=0 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=1
+TRIM: result RUN=EMPTY VERDICT=NONE SCOPE=NONE ACTION=ADJUST
 ```
 
 Internal pytest/plugin crash:
 
 ```text
-TRIM: RUN=ERROR VERDICT=UNKNOWN SCOPE=FULL ACTION=INVESTIGATE
+TRIM: counts selected=0 executed=0 passed=0 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=ERROR VERDICT=UNKNOWN SCOPE=FULL ACTION=INVESTIGATE
 ```
 
 External halt (Ctrl-C, `pytest.exit(...)`):
 
 ```text
-TRIM: RUN=INTERRUPTED VERDICT=UNKNOWN SCOPE=FULL ACTION=ABORT
+TRIM: counts selected=1 executed=0 passed=0 failed=0 errors=0 collection_errors=0 skipped=0 xfailed=0 xpassed=0 deselected=0
+TRIM: result RUN=INTERRUPTED VERDICT=UNKNOWN SCOPE=FULL ACTION=ABORT
 ```
 
 ## Recommended Runner Loop
@@ -275,7 +234,7 @@ If you want a caller or agent to drive pytest automatically:
    pytest --trim --sw --ff --nf
    ```
 
-2. Read the last output line.
+2. Read the final `TRIM: result ...` row.
 
 3. React as follows:
 

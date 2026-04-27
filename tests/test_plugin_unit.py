@@ -197,7 +197,20 @@ def test_pytest_configure_respects_trim_and_xdist(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
     plugin.pytest_configure(worker)
     monkeypatch.delenv("PYTEST_XDIST_WORKER")
-    assert worker.pluginmanager.registered == []
+    assert len(worker.pluginmanager.registered) == 1
+    worker_plugin, worker_name = worker.pluginmanager.registered[0]
+    assert isinstance(worker_plugin, plugin.TrimWorkerReporter)
+    assert worker_name == "trimworkerreporter"
+
+    existing_worker = FakeConfig(
+        tmp_path,
+        getoptions={"--trim": True},
+        plugins={"trimworkerreporter": object()},
+    )
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    plugin.pytest_configure(existing_worker)
+    monkeypatch.delenv("PYTEST_XDIST_WORKER")
+    assert existing_worker.pluginmanager.registered == []
 
 
 def test_terminal_writer_helpers_are_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -686,7 +699,7 @@ def test_emitters_and_unconfigure_are_idempotent(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         collect_only,
         "_final_outcome",
-        lambda: pytest.fail("collect-only runs must not compute a final protocol line"),
+        lambda: pytest.fail("collect-only runs must not compute protocol footer rows"),
     )
     collect_only.pytest_unconfigure(collect_only_config)
     assert collect_only_calls == ["issues"]
@@ -694,6 +707,94 @@ def test_emitters_and_unconfigure_are_idempotent(monkeypatch: pytest.MonkeyPatch
     finished, config = make_reporter(tmp_path)
     finished._final_line_emitted = True
     finished.pytest_unconfigure(config)
+
+
+def test_footer_and_count_edge_helpers_cover_idempotent_paths(tmp_path: Path) -> None:
+    reporter, _ = make_reporter(tmp_path)
+    reporter._tw = RecordingWriter()
+
+    reporter._final_line_emitted = True
+    reporter._emit_footer(plugin.TrimCounts(), plugin.FinalOutcome("COMPLETE", "PASS", "FULL", "DONE"))
+    assert reporter._tw.lines == []
+
+    reporter._stdout_tracker = None
+    reporter._restore_stdout_tracker()
+
+    reporter._selected_count = None
+    reporter._xdist_collected_nodeids = {"test_a.py::test_one", "test_a.py::test_two"}
+    assert reporter._resolved_selected_count() == 2
+
+    reporter.stats["error"] = [make_collect_report()]
+    assert reporter._resolved_selected_count() == 0
+    reporter.stats.pop("error")
+
+    reporter._xdist_collected_nodeids = set()
+    reporter._item_outcomes = {"test_a.py::test_one": "passed"}
+    assert reporter._resolved_selected_count() == 1
+
+    reporter._xdist_deselected_nodeids = {"test_a.py::test_two"}
+    assert reporter._resolved_deselected_count() == 1
+
+    assert reporter._outcome_bucket(SimpleNamespace(failed=False, skipped=False, passed=False, when="call")) is None
+
+
+def test_xdist_hooks_record_unique_selected_and_deselected_items(tmp_path: Path) -> None:
+    reporter, _ = make_reporter(tmp_path)
+
+    reporter.pytest_xdist_node_collection_finished(
+        object(),
+        ["test_a.py::test_one", "test_a.py::test_two"],
+    )
+    reporter.pytest_xdist_node_collection_finished(
+        object(),
+        ["test_a.py::test_one", "test_a.py::test_two"],
+    )
+
+    assert reporter._selected_count == 2
+
+    reporter.pytest_testnodedown(
+        SimpleNamespace(
+            workeroutput={
+                "trim_deselected_nodeids": [
+                    "test_a.py::test_three",
+                    42,
+                ]
+            }
+        ),
+        None,
+    )
+    reporter.pytest_testnodedown(
+        SimpleNamespace(workeroutput={"trim_deselected_nodeids": ["test_a.py::test_three"]}),
+        None,
+    )
+    reporter.pytest_testnodedown(SimpleNamespace(workeroutput=None), None)
+    reporter.pytest_testnodedown(
+        SimpleNamespace(workeroutput={"trim_deselected_nodeids": "test_a.py::test_four"}),
+        None,
+    )
+
+    assert reporter._resolved_deselected_count() == 1
+
+
+def test_trim_worker_reporter_exports_deselected_nodeids(tmp_path: Path) -> None:
+    config = SimpleNamespace(workeroutput={})
+    reporter = plugin.TrimWorkerReporter(config)
+
+    reporter.pytest_deselected(
+        [
+            SimpleNamespace(nodeid="test_a.py::test_two"),
+            SimpleNamespace(nodeid="test_a.py::test_three"),
+        ]
+    )
+    reporter.pytest_sessionfinish(SimpleNamespace(), 0)
+
+    assert config.workeroutput["trim_deselected_nodeids"] == [
+        "test_a.py::test_three",
+        "test_a.py::test_two",
+    ]
+
+    no_output_reporter = plugin.TrimWorkerReporter(SimpleNamespace())
+    no_output_reporter.pytest_sessionfinish(SimpleNamespace(), 0)
 
 
 def test_selection_followup_and_scope_helpers(tmp_path: Path) -> None:
